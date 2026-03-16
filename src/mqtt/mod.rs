@@ -128,11 +128,15 @@ impl MqttBridge {
         config: &serde_json::Value,
     ) -> Result<()> {
         let topic = format!("homeassistant/{component}/{node_id}/{object_id}/config");
+        tracing::debug!("HA discovery → {topic}");
         let payload = serde_json::to_vec(config)?;
         self.client
             .publish(&topic, QoS::AtLeastOnce, true, payload)
             .await
-            .map_err(Error::Mqtt)
+            .map_err(|e| {
+                tracing::error!("Failed to publish HA discovery to {topic}: {e}");
+                Error::Mqtt(e)
+            })
     }
 
     async fn publish_retained(&self, topic: &str, payload: &[u8]) -> Result<()> {

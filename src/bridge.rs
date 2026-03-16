@@ -38,49 +38,76 @@ impl Bridge {
         // 1. Import device database from existing zigbee2mqtt install
         self.import_database();
 
-        // 2. Connect MQTT
+        // 2. Apply device configs (friendly names override database)
+        self.apply_device_configs();
+
+        // 3. Log device summary
+        let all = self.devices.all_devices();
+        info!(
+            "Device registry: {} devices ({} interviewed)",
+            all.len(),
+            all.iter().filter(|d| d.interview_complete).count()
+        );
+        for dev in &all {
+            info!(
+                "  {} ({}) nwk=0x{:04X} eps={} interviewed={} model={:?}",
+                dev.friendly_name,
+                dev.ieee_addr,
+                dev.nwk_addr,
+                dev.endpoints.len(),
+                dev.interview_complete,
+                dev.model.as_deref().unwrap_or("-"),
+            );
+        }
+        drop(all);
+
+        // 4. Connect MQTT
         let (mqtt, mut mqtt_rx) = MqttBridge::connect(&self.cfg.mqtt)?;
         mqtt.publish_bridge_state(true).await?;
-        info!("MQTT bridge online");
+        info!("MQTT bridge online (base_topic={})", self.cfg.mqtt.base_topic);
 
-        // 3. Open coordinator
+        // 5. Open coordinator
         let mut coord = open_coordinator(&self.cfg).await?;
         info!("Coordinator ready");
 
-        // 4. Publish bridge/info
+        // 6. Publish bridge/info
         self.publish_bridge_info(&mqtt, &coord).await;
 
-        // 5. Apply device configs (friendly names override database)
-        self.apply_device_configs();
-
-        // 6. Permit join if configured
+        // 7. Permit join if configured
         if self.cfg.permit_join {
             coord.permit_join(254).await?;
             info!("Permit join enabled (254 s)");
         }
 
-        // 7. Publish HA discovery for all already-known devices
-        if self.cfg.homeassistant {
-            let coordinator_ieee_str = coord
-                .info
-                .ieee_addr
-                .map(|a| IeeeAddr(a).as_hex())
-                .unwrap_or_default();
-            for dev in self.devices.all_devices() {
-                if dev.interview_complete {
-                    homeassistant::publish_discovery(
-                        &mqtt,
-                        &dev,
-                        &self.cfg.mqtt.base_topic,
-                        &coordinator_ieee_str,
-                    )
-                    .await;
-                }
+        // 8. Publish HA discovery + initial state for all known devices
+        let coordinator_ieee_str = coord
+            .info
+            .ieee_addr
+            .map(|a| IeeeAddr(a).as_hex())
+            .unwrap_or_default();
+        for dev in self.devices.all_devices() {
+            // Publish initial state so HA sees the device immediately
+            let state = serde_json::Value::Object(dev.state.clone());
+            if let Err(e) = mqtt.publish_device_state(&dev.friendly_name, &state).await {
+                warn!("Failed to publish state for {}: {e}", dev.friendly_name);
+            }
+
+            // Publish HA discovery
+            if self.cfg.homeassistant && dev.interview_complete {
+                info!("Publishing HA discovery for {}", dev.friendly_name);
+                homeassistant::publish_discovery(
+                    &mqtt,
+                    &dev,
+                    &self.cfg.mqtt.base_topic,
+                    &coordinator_ieee_str,
+                )
+                .await;
             }
         }
 
-        // 8. Publish current device list
+        // 9. Publish device list
         self.publish_device_list(&mqtt).await;
+        info!("Startup complete, entering main loop");
 
         let devices = Arc::clone(&self.devices);
         let base_topic = self.cfg.mqtt.base_topic.clone();
@@ -253,15 +280,19 @@ impl Bridge {
                             mqtt.publish_bridge_log("info", &format!("Permit join: {duration}s")).await.ok();
                         }
                         Some(MqttCommand::SetDevice { friendly_name, payload }) => {
+                            info!("MQTT set: {friendly_name} → {payload}");
                             Self::handle_set(
                                 &devices, &coord, &mut trans_id,
                                 &friendly_name, &payload,
                             ).await;
                         }
                         Some(MqttCommand::GetDevice { friendly_name, .. }) => {
+                            debug!("MQTT get: {friendly_name}");
                             if let Some(dev) = devices.find_by_name(&friendly_name) {
                                 let state = serde_json::Value::Object(dev.state);
                                 mqtt.publish_device_state(&friendly_name, &state).await.ok();
+                            } else {
+                                warn!("Get command for unknown device: {friendly_name}");
                             }
                         }
                     }

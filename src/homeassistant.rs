@@ -2,9 +2,16 @@
 /// Publishes discovery configs to `homeassistant/<component>/<node_id>/<object_id>/config`
 /// matching the exact format zigbee2mqtt uses for HA compatibility.
 use serde_json::{json, Value};
+use tracing::warn;
 
 use crate::devices::Device;
 use crate::mqtt::MqttBridge;
+
+async fn publish(mqtt: &MqttBridge, component: &str, ieee: &str, object_id: &str, config: &Value) {
+    if let Err(e) = mqtt.publish_ha_discovery(component, ieee, object_id, config).await {
+        warn!("HA discovery error for {component}/{ieee}/{object_id}: {e}");
+    }
+}
 
 /// Publish all HA discovery messages for a device.
 pub async fn publish_discovery(
@@ -42,9 +49,7 @@ pub async fn publish_discovery(
             } else if has_level {
                 config["supported_color_modes"] = json!(["brightness"]);
             }
-            mqtt.publish_ha_discovery("light", &ieee_hex, "light", &config)
-                .await
-                .ok();
+            publish(mqtt, "light", &ieee_hex, "light", &config).await;
         } else {
             let config = json!({
                 "availability": availability,
@@ -57,9 +62,7 @@ pub async fn publish_discovery(
                 "payload_on": "ON",
                 "payload_off": "OFF",
             });
-            mqtt.publish_ha_discovery("switch", &ieee_hex, "switch", &config)
-                .await
-                .ok();
+            publish(mqtt, "switch", &ieee_hex, "switch", &config).await;
         }
     }
 
@@ -141,9 +144,7 @@ pub async fn publish_discovery(
             "payload_off": false,
             "enabled_by_default": true,
         });
-        mqtt.publish_ha_discovery("binary_sensor", &ieee_hex, "occupancy", &config)
-            .await
-            .ok();
+        publish(mqtt, "binary_sensor", &ieee_hex, "occupancy", &config).await;
     }
 
     // ── IAS Zone contact sensor ───────────────────────────────────────────
@@ -160,9 +161,7 @@ pub async fn publish_discovery(
             "payload_off": true,
             "enabled_by_default": true,
         });
-        mqtt.publish_ha_discovery("binary_sensor", &ieee_hex, "contact", &config)
-            .await
-            .ok();
+        publish(mqtt, "binary_sensor", &ieee_hex, "contact", &config).await;
     }
 
     // ── Link quality diagnostic sensor ────────────────────────────────────
@@ -180,9 +179,7 @@ pub async fn publish_discovery(
             "entity_category": "diagnostic",
             "enabled_by_default": true,
         });
-        mqtt.publish_ha_discovery("sensor", &ieee_hex, "linkquality", &config)
-            .await
-            .ok();
+        publish(mqtt, "sensor", &ieee_hex, "linkquality", &config).await;
     }
 }
 
@@ -209,9 +206,7 @@ async fn publish_sensor(
         "value_template": format!("{{{{ value_json.{value_key} }}}}"),
         "enabled_by_default": true,
     });
-    mqtt.publish_ha_discovery("sensor", ieee_hex, device_class, &config)
-        .await
-        .ok();
+    publish(mqtt, "sensor", ieee_hex, device_class, &config).await;
 }
 
 fn device_block(device: &Device, base_topic: &str, coordinator_ieee: &str) -> Value {
