@@ -59,7 +59,7 @@ impl Device {
     pub fn device_type(&self) -> &'static str {
         // Simple heuristic: devices with only battery power or no routing are EndDevice
         if let Some(ref ps) = self.power_source {
-            if ps == "battery" {
+            if ps.eq_ignore_ascii_case("battery") {
                 return "EndDevice";
             }
         }

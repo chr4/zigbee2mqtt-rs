@@ -1,5 +1,6 @@
 pub mod config;
 pub mod coordinator;
+pub mod database;
 pub mod devices;
 pub mod error;
 pub mod homeassistant;

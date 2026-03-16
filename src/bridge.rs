@@ -4,8 +4,11 @@ use std::sync::Arc;
 use serde_json::json;
 use tracing::{debug, error, info, warn};
 
+use std::path::PathBuf;
+
 use zigbee2mqtt_rs::config::Config;
 use zigbee2mqtt_rs::coordinator::{open_coordinator, CoordinatorEvent, CoordinatorHandle};
+use zigbee2mqtt_rs::database;
 use zigbee2mqtt_rs::devices::{Device, DeviceRegistry};
 use zigbee2mqtt_rs::error::Result;
 use zigbee2mqtt_rs::homeassistant;
@@ -18,40 +21,65 @@ use zigbee2mqtt_rs::zigbee::{EndpointDesc, IeeeAddr};
 
 pub struct Bridge {
     cfg: Config,
+    config_path: PathBuf,
     devices: Arc<DeviceRegistry>,
 }
 
 impl Bridge {
-    pub fn new(cfg: Config) -> Self {
+    pub fn new(cfg: Config, config_path: PathBuf) -> Self {
         Self {
             cfg,
+            config_path,
             devices: Arc::new(DeviceRegistry::new()),
         }
     }
 
     pub async fn run(self) -> Result<()> {
-        // 1. Connect MQTT
+        // 1. Import device database from existing zigbee2mqtt install
+        self.import_database();
+
+        // 2. Connect MQTT
         let (mqtt, mut mqtt_rx) = MqttBridge::connect(&self.cfg.mqtt)?;
         mqtt.publish_bridge_state(true).await?;
         info!("MQTT bridge online");
 
-        // 2. Open coordinator
+        // 3. Open coordinator
         let mut coord = open_coordinator(&self.cfg).await?;
         info!("Coordinator ready");
 
-        // 3. Publish bridge/info
+        // 4. Publish bridge/info
         self.publish_bridge_info(&mqtt, &coord).await;
 
-        // 4. Apply device configs (friendly names) from configuration
+        // 5. Apply device configs (friendly names override database)
         self.apply_device_configs();
 
-        // 5. Permit join if configured
+        // 6. Permit join if configured
         if self.cfg.permit_join {
             coord.permit_join(254).await?;
             info!("Permit join enabled (254 s)");
         }
 
-        // 6. Publish current device list
+        // 7. Publish HA discovery for all already-known devices
+        if self.cfg.homeassistant {
+            let coordinator_ieee_str = coord
+                .info
+                .ieee_addr
+                .map(|a| IeeeAddr(a).as_hex())
+                .unwrap_or_default();
+            for dev in self.devices.all_devices() {
+                if dev.interview_complete {
+                    homeassistant::publish_discovery(
+                        &mqtt,
+                        &dev,
+                        &self.cfg.mqtt.base_topic,
+                        &coordinator_ieee_str,
+                    )
+                    .await;
+                }
+            }
+        }
+
+        // 8. Publish current device list
         self.publish_device_list(&mqtt).await;
 
         let devices = Arc::clone(&self.devices);
@@ -245,8 +273,18 @@ impl Bridge {
         Ok(())
     }
 
-    /// Pre-seed the device registry from config so devices are findable by
-    /// friendly name even before they re-announce on the network.
+    /// Import devices from an existing zigbee2mqtt database.db file.
+    fn import_database(&self) {
+        if let Some(db_path) = database::find_database(&self.config_path) {
+            let (devices, _coord_ieee) = database::load_database(&db_path, &self.cfg.devices);
+            for dev in devices {
+                self.devices.add(dev);
+            }
+        }
+    }
+
+    /// Apply friendly names from config, overriding database values.
+    /// Also pre-seeds stub entries for devices in config but not in database.
     fn apply_device_configs(&self) {
         for (ieee_str, cfg) in &self.cfg.devices {
             if let Some(ieee) = parse_ieee_addr(ieee_str) {
