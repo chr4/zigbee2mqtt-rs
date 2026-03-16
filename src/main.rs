@@ -1,20 +1,12 @@
-mod bridge;
-mod config;
-mod coordinator;
-mod devices;
-mod error;
-mod homeassistant;
-mod mqtt;
-mod zigbee;
-
 use std::path::PathBuf;
 
 use clap::Parser;
 use tracing::error;
 use tracing_subscriber::{fmt, EnvFilter};
 
-use bridge::Bridge;
-use config::Config;
+use zigbee2mqtt_rs::config::Config;
+
+mod bridge;
 
 #[derive(Debug, Parser)]
 #[command(name = "zigbee2mqtt-rs", about = "Zigbee to MQTT bridge")]
@@ -63,7 +55,7 @@ async fn main() {
         cfg.mqtt.port
     );
 
-    let bridge = Bridge::new(cfg);
+    let bridge = bridge::Bridge::new(cfg);
 
     if let Err(e) = bridge.run().await {
         error!("Bridge error: {e}");

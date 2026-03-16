@@ -4,17 +4,17 @@ use std::sync::Arc;
 use serde_json::json;
 use tracing::{debug, error, info, warn};
 
-use crate::config::Config;
-use crate::coordinator::{open_coordinator, CoordinatorEvent, CoordinatorHandle};
-use crate::devices::{Device, DeviceRegistry};
-use crate::error::Result;
-use crate::homeassistant;
-use crate::mqtt::{MqttBridge, MqttCommand};
-use crate::zigbee::zcl;
-use crate::zigbee::zcl::clusters::color;
-use crate::zigbee::zcl::clusters::level;
-use crate::zigbee::zcl::clusters::on_off;
-use crate::zigbee::{EndpointDesc, IeeeAddr};
+use zigbee2mqtt_rs::config::Config;
+use zigbee2mqtt_rs::coordinator::{open_coordinator, CoordinatorEvent, CoordinatorHandle};
+use zigbee2mqtt_rs::devices::{Device, DeviceRegistry};
+use zigbee2mqtt_rs::error::Result;
+use zigbee2mqtt_rs::homeassistant;
+use zigbee2mqtt_rs::mqtt::{MqttBridge, MqttCommand};
+use zigbee2mqtt_rs::zigbee::zcl;
+use zigbee2mqtt_rs::zigbee::zcl::clusters::color;
+use zigbee2mqtt_rs::zigbee::zcl::clusters::level;
+use zigbee2mqtt_rs::zigbee::zcl::clusters::on_off;
+use zigbee2mqtt_rs::zigbee::{EndpointDesc, IeeeAddr};
 
 pub struct Bridge {
     cfg: Config,
@@ -58,6 +58,11 @@ impl Bridge {
         let base_topic = self.cfg.mqtt.base_topic.clone();
         let ha_enabled = self.cfg.homeassistant;
         let device_configs = self.cfg.devices.clone();
+        let coordinator_ieee = coord
+            .info
+            .ieee_addr
+            .map(|a| IeeeAddr(a).as_hex())
+            .unwrap_or_default();
 
         // 7. Main event loop
         let mut trans_id: u8 = 0;
@@ -134,7 +139,7 @@ impl Bridge {
 
                             // Request basic cluster attributes (manufacturer, model)
                             if input_clusters.contains(&0x0000) {
-                                let payload = crate::zigbee::zcl::frame::read_attributes_payload(
+                                let payload = zigbee2mqtt_rs::zigbee::zcl::frame::read_attributes_payload(
                                     &[0x0004, 0x0005, 0x0007, 0x4000],
                                 );
                                 trans_id = trans_id.wrapping_add(1);
@@ -146,7 +151,7 @@ impl Bridge {
                             // Publish HA discovery after interview
                             if ha_enabled && interview_just_completed {
                                 if let Some(dev) = devices.get_by_nwk(nwk_addr) {
-                                    homeassistant::publish_discovery(&mqtt, &dev, &base_topic).await;
+                                    homeassistant::publish_discovery(&mqtt, &dev, &base_topic, &coordinator_ieee).await;
                                 }
                             }
                         }
