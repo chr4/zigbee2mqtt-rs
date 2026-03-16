@@ -282,7 +282,7 @@ impl Bridge {
                         Some(MqttCommand::SetDevice { friendly_name, payload }) => {
                             info!("MQTT set: {friendly_name} → {payload}");
                             Self::handle_set(
-                                &devices, &coord, &mut trans_id,
+                                &devices, &coord, &mqtt, &mut trans_id,
                                 &friendly_name, &payload,
                             ).await;
                         }
@@ -367,6 +367,7 @@ impl Bridge {
     async fn handle_set(
         devices: &DeviceRegistry,
         coord: &CoordinatorHandle,
+        mqtt: &MqttBridge,
         trans_id: &mut u8,
         name: &str,
         payload: &serde_json::Value,
@@ -388,25 +389,29 @@ impl Bridge {
         }
 
         let nwk_addr = dev.nwk_addr;
-        let endpoints = &dev.endpoints;
+        let endpoints = dev.endpoints.clone();
+
+        // Build optimistic state from the command payload
+        let mut optimistic = serde_json::Map::new();
 
         // Handle state (on/off)
         if let Some(state_val) = payload.get("state") {
             let state_str = state_val.as_str().unwrap_or("");
-            if let Some(ep) = find_ep_with_cluster(endpoints, 0x0006) {
+            if let Some(ep) = find_ep_with_cluster(&endpoints, 0x0006) {
                 if let Some(zcl_payload) = on_off::set_state_payload(*trans_id, state_str) {
                     *trans_id = trans_id.wrapping_add(1);
                     coord
                         .send_zcl(nwk_addr, ep, 0x0006, *trans_id, zcl_payload)
                         .await
                         .ok();
+                    optimistic.insert("state".into(), json!(state_str.to_uppercase()));
                 }
             }
         }
 
         // Handle brightness
         if let Some(brightness) = payload.get("brightness").and_then(|v| v.as_u64()) {
-            if let Some(ep) = find_ep_with_cluster(endpoints, 0x0008) {
+            if let Some(ep) = find_ep_with_cluster(&endpoints, 0x0008) {
                 let lvl = brightness.min(254) as u8;
                 let transition = transition_time(payload);
                 let zcl_payload = level::move_to_level_payload(*trans_id, lvl, transition);
@@ -415,12 +420,17 @@ impl Bridge {
                     .send_zcl(nwk_addr, ep, 0x0008, *trans_id, zcl_payload)
                     .await
                     .ok();
+                optimistic.insert("brightness".into(), json!(lvl));
+                // Move-to-level-with-on/off implies state ON
+                if !optimistic.contains_key("state") {
+                    optimistic.insert("state".into(), json!("ON"));
+                }
             }
         }
 
         // Handle color_temp
         if let Some(ct) = payload.get("color_temp").and_then(|v| v.as_u64()) {
-            if let Some(ep) = find_ep_with_cluster(endpoints, 0x0300) {
+            if let Some(ep) = find_ep_with_cluster(&endpoints, 0x0300) {
                 let transition = transition_time(payload);
                 let zcl_payload =
                     color::move_to_color_temp_payload(*trans_id, ct as u16, transition);
@@ -429,29 +439,33 @@ impl Bridge {
                     .send_zcl(nwk_addr, ep, 0x0300, *trans_id, zcl_payload)
                     .await
                     .ok();
+                optimistic.insert("color_temp".into(), json!(ct));
+                optimistic.insert("color_mode".into(), json!("color_temp"));
             }
         }
 
-        // Handle color object: {"color": {"x": 0.3, "y": 0.3}} or {"color": {"hue": 180, "saturation": 100}}
+        // Handle color object
         if let Some(color_obj) = payload.get("color").and_then(|v| v.as_object()) {
-            if let Some(ep) = find_ep_with_cluster(endpoints, 0x0300) {
+            if let Some(ep) = find_ep_with_cluster(&endpoints, 0x0300) {
                 let transition = transition_time(payload);
 
                 if let (Some(x), Some(y)) = (
                     color_obj.get("x").and_then(|v| v.as_f64()),
                     color_obj.get("y").and_then(|v| v.as_f64()),
                 ) {
-                    let zcl_payload = color::move_to_color_xy_payload(*trans_id, x, y, transition);
+                    let zcl_payload =
+                        color::move_to_color_xy_payload(*trans_id, x, y, transition);
                     *trans_id = trans_id.wrapping_add(1);
                     coord
                         .send_zcl(nwk_addr, ep, 0x0300, *trans_id, zcl_payload)
                         .await
                         .ok();
+                    optimistic.insert("color".into(), json!({"x": x, "y": y}));
+                    optimistic.insert("color_mode".into(), json!("xy"));
                 } else if let (Some(h), Some(s)) = (
                     color_obj.get("hue").and_then(|v| v.as_f64()),
                     color_obj.get("saturation").and_then(|v| v.as_f64()),
                 ) {
-                    // Convert from z2m 0-360/0-100 to ZCL 0-254
                     let zcl_hue = ((h / 360.0) * 254.0).round() as u8;
                     let zcl_sat = ((s / 100.0) * 254.0).round() as u8;
                     let zcl_payload =
@@ -461,7 +475,25 @@ impl Bridge {
                         .send_zcl(nwk_addr, ep, 0x0300, *trans_id, zcl_payload)
                         .await
                         .ok();
+                    optimistic
+                        .insert("color".into(), json!({"hue": h, "saturation": s}));
+                    optimistic.insert("color_mode".into(), json!("hs"));
                 }
+            }
+        }
+
+        // Publish optimistic state immediately (z2m behavior)
+        if !optimistic.is_empty() {
+            // Merge with existing device state
+            if let Some(mut dev) = devices.get_mut_by_nwk(nwk_addr) {
+                dev.merge_state(optimistic.clone());
+                dev.state
+                    .insert("last_seen".into(), json!(now_iso8601()));
+            }
+            // Publish the full merged state
+            if let Some(dev) = devices.find_by_name(name) {
+                let full_state = serde_json::Value::Object(dev.state);
+                mqtt.publish_device_state(name, &full_state).await.ok();
             }
         }
     }
