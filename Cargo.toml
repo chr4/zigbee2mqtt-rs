@@ -5,6 +5,10 @@ edition = "2021"
 description = "Zigbee to MQTT bridge written in Rust"
 license = "MIT"
 
+[lib]
+name = "zigbee2mqtt_rs"
+path = "src/lib.rs"
+
 [[bin]]
 name = "zigbee2mqtt-rs"
 path = "src/main.rs"
