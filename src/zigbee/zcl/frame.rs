@@ -20,11 +20,6 @@ pub enum FrameType {
     ClusterSpecific = 1,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Direction {
-    ClientToServer = 0,
-}
-
 #[derive(Debug, Clone)]
 pub struct ZclFrameHeader {
     pub frame_type: FrameType,
@@ -70,7 +65,7 @@ impl ZclFrameHeader {
         ))
     }
 
-    fn encode_global(sequence: u8, command_id: u8, _direction: Direction) -> Vec<u8> {
+    fn encode_global(sequence: u8, command_id: u8) -> Vec<u8> {
         vec![0x10, sequence, command_id] // client→server, disable default rsp
     }
 }
@@ -84,7 +79,7 @@ pub mod global {
 /// Build a ZCL Read Attributes request payload.
 pub fn read_attributes_payload(attr_ids: &[u16]) -> Vec<u8> {
     let mut payload =
-        ZclFrameHeader::encode_global(0x01, global::READ_ATTRIBUTES, Direction::ClientToServer);
+        ZclFrameHeader::encode_global(0x01, global::READ_ATTRIBUTES);
     for &id in attr_ids {
         payload.extend_from_slice(&id.to_le_bytes());
     }

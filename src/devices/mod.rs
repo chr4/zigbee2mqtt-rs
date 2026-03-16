@@ -56,6 +56,7 @@ impl Device {
     }
 
     /// Determine device type based on capabilities.
+    #[must_use]
     pub fn device_type(&self) -> &'static str {
         // Simple heuristic: devices with only battery power or no routing are EndDevice
         if let Some(ref ps) = self.power_source {
@@ -67,6 +68,7 @@ impl Device {
     }
 
     /// All unique input clusters across all endpoints.
+    #[must_use]
     pub fn all_input_clusters(&self) -> Vec<u16> {
         let mut clusters: Vec<u16> = self
             .endpoints
@@ -79,6 +81,7 @@ impl Device {
     }
 
     /// Generate z2m-compatible device info JSON for bridge/devices.
+    #[must_use]
     pub fn to_z2m_device_json(&self) -> serde_json::Value {
         let definition = if self.manufacturer.is_some() || self.model.is_some() {
             json!({
@@ -170,6 +173,7 @@ impl DeviceRegistry {
         self.by_ieee.get_mut(&ieee)
     }
 
+    #[must_use]
     pub fn find_by_name(&self, name: &str) -> Option<Device> {
         let ieee = self.by_name.get(name)?;
         self.by_ieee.get(ieee.value()).map(|r| r.value().clone())
@@ -190,6 +194,7 @@ impl DeviceRegistry {
         }
     }
 
+    #[must_use]
     pub fn all_devices(&self) -> Vec<Device> {
         self.by_ieee.iter().map(|r| r.value().clone()).collect()
     }

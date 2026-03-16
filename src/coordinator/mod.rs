@@ -5,20 +5,21 @@ use tokio::sync::{mpsc, Mutex};
 
 use crate::config::{AdapterType, Config};
 use crate::error::Result;
+use crate::zigbee::IeeeAddr;
 use znp::{ZnpCoordinator, ZnpHandle};
 
 #[derive(Debug, Clone)]
 pub enum CoordinatorEvent {
     DeviceJoined {
-        ieee_addr: [u8; 8],
+        ieee_addr: IeeeAddr,
         nwk_addr: u16,
     },
     DeviceLeft {
-        ieee_addr: [u8; 8],
+        ieee_addr: IeeeAddr,
     },
     /// IEEE↔NWK address resolved (from ZDO_IEEE_ADDR_RSP or TC_DEV_IND).
     AddressResolved {
-        ieee_addr: [u8; 8],
+        ieee_addr: IeeeAddr,
         nwk_addr: u16,
     },
     Message {
@@ -44,7 +45,7 @@ pub enum CoordinatorEvent {
 
 #[derive(Debug, Clone)]
 pub struct CoordinatorInfo {
-    pub ieee_addr: Option<[u8; 8]>,
+    pub ieee_addr: Option<IeeeAddr>,
     pub version: String,
     pub transport_rev: u8,
 }
@@ -103,7 +104,7 @@ pub async fn open_coordinator(cfg: &Config) -> Result<CoordinatorHandle> {
             coord.start(cfg).await
         }
         AdapterType::Ezsp => {
-            unimplemented!("EZSP adapter support is not yet implemented");
+            Err(crate::error::Error::Config("EZSP adapter not yet supported".into()))
         }
     }
 }

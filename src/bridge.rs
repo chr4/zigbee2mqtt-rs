@@ -1,4 +1,4 @@
-/// The main bridge – ties coordinator, MQTT, device registry, and ZCL together.
+/// The main bridge -- ties coordinator, MQTT, device registry, and ZCL together.
 use std::sync::Arc;
 
 use serde_json::json;
@@ -6,18 +6,18 @@ use tracing::{debug, error, info, warn};
 
 use std::path::PathBuf;
 
-use zigbee2mqtt_rs::config::Config;
-use zigbee2mqtt_rs::coordinator::{open_coordinator, CoordinatorEvent, CoordinatorHandle};
-use zigbee2mqtt_rs::database;
-use zigbee2mqtt_rs::devices::{Device, DeviceRegistry};
-use zigbee2mqtt_rs::error::Result;
-use zigbee2mqtt_rs::homeassistant;
-use zigbee2mqtt_rs::mqtt::{MqttBridge, MqttCommand};
-use zigbee2mqtt_rs::zigbee::zcl;
-use zigbee2mqtt_rs::zigbee::zcl::clusters::color;
-use zigbee2mqtt_rs::zigbee::zcl::clusters::level;
-use zigbee2mqtt_rs::zigbee::zcl::clusters::on_off;
-use zigbee2mqtt_rs::zigbee::{EndpointDesc, IeeeAddr};
+use crate::config::Config;
+use crate::coordinator::{open_coordinator, CoordinatorEvent, CoordinatorHandle};
+use crate::database;
+use crate::devices::{Device, DeviceRegistry};
+use crate::error::Result;
+use crate::homeassistant;
+use crate::mqtt::{MqttBridge, MqttCommand};
+use crate::zigbee::zcl;
+use crate::zigbee::zcl::clusters::color;
+use crate::zigbee::zcl::clusters::level;
+use crate::zigbee::zcl::clusters::on_off;
+use crate::zigbee::{EndpointDesc, IeeeAddr};
 
 pub struct Bridge {
     cfg: Config,
@@ -83,7 +83,7 @@ impl Bridge {
         let coordinator_ieee_str = coord
             .info
             .ieee_addr
-            .map(|a| IeeeAddr(a).as_hex())
+            .map(|a| a.as_hex())
             .unwrap_or_default();
         for dev in self.devices.all_devices() {
             // Publish initial state so HA sees the device immediately
@@ -116,7 +116,7 @@ impl Bridge {
         let coordinator_ieee = coord
             .info
             .ieee_addr
-            .map(|a| IeeeAddr(a).as_hex())
+            .map(|a| a.as_hex())
             .unwrap_or_default();
 
         // 7. Main event loop
@@ -124,7 +124,7 @@ impl Bridge {
 
         loop {
             tokio::select! {
-                // ── Coordinator events ────────────────────────────────────────
+                // -- Coordinator events --
                 event = coord.events.recv() => {
                     match event {
                         None => {
@@ -132,7 +132,7 @@ impl Bridge {
                             break;
                         }
                         Some(CoordinatorEvent::DeviceJoined { ieee_addr, nwk_addr }) => {
-                            let ieee = IeeeAddr(ieee_addr);
+                            let ieee = ieee_addr;
                             info!("Device joined: {ieee} (0x{nwk_addr:04X})");
 
                             if devices.get_by_ieee(&ieee).is_none() {
@@ -149,28 +149,34 @@ impl Bridge {
                                 devices.update_nwk_addr(&ieee, nwk_addr);
                             }
 
-                            mqtt.publish_bridge_log("info", &format!("Device joined: {ieee}")).await.ok();
-                            coord.request_active_eps(nwk_addr).await.ok();
+                            if let Err(e) = mqtt.publish_bridge_log("info", &format!("Device joined: {ieee}")).await {
+                                warn!("Failed to publish bridge log: {e}");
+                            }
+                            if let Err(e) = coord.request_active_eps(nwk_addr).await {
+                                warn!("Failed to request active endpoints: {e}");
+                            }
                         }
 
                         Some(CoordinatorEvent::DeviceLeft { ieee_addr, .. }) => {
-                            let ieee = IeeeAddr(ieee_addr);
+                            let ieee = ieee_addr;
                             info!("Device left: {ieee}");
                             devices.remove_by_ieee(&ieee);
-                            mqtt.publish_bridge_log("info", &format!("Device left: {ieee}")).await.ok();
+                            if let Err(e) = mqtt.publish_bridge_log("info", &format!("Device left: {ieee}")).await {
+                                warn!("Failed to publish bridge log: {e}");
+                            }
                             Self::publish_device_list_static(&devices, &mqtt).await;
                         }
 
                         Some(CoordinatorEvent::AddressResolved { ieee_addr, nwk_addr }) => {
-                            let ieee = IeeeAddr(ieee_addr);
-                            debug!("Address resolved: {ieee} → 0x{nwk_addr:04X}");
+                            let ieee = ieee_addr;
+                            debug!("Address resolved: {ieee} -> 0x{nwk_addr:04X}");
 
                             let known = devices.get_by_ieee(&ieee).is_some();
                             if known {
                                 info!("Linking {ieee} to NWK 0x{nwk_addr:04X}");
                                 devices.update_nwk_addr(&ieee, nwk_addr);
                             } else {
-                                // Unknown IEEE — create a new device entry
+                                // Unknown IEEE -- create a new device entry
                                 let mut dev = Device::new(ieee, nwk_addr);
                                 if let Some(cfg) = device_configs.get(&ieee.as_hex()) {
                                     if let Some(ref name) = cfg.friendly_name {
@@ -182,14 +188,18 @@ impl Bridge {
 
                             // Trigger interview if not done yet
                             if devices.get_by_ieee(&ieee).map_or(false, |d| !d.interview_complete) {
-                                coord.request_active_eps(nwk_addr).await.ok();
+                                if let Err(e) = coord.request_active_eps(nwk_addr).await {
+                                    warn!("Failed to request active endpoints: {e}");
+                                }
                             }
                         }
 
                         Some(CoordinatorEvent::ActiveEpRsp { nwk_addr, endpoints }) => {
                             debug!("Active EPs for 0x{nwk_addr:04X}: {endpoints:?}");
                             for ep in endpoints {
-                                coord.request_simple_desc(nwk_addr, ep).await.ok();
+                                if let Err(e) = coord.request_simple_desc(nwk_addr, ep).await {
+                                    warn!("Failed to request simple descriptor: {e}");
+                                }
                             }
                         }
 
@@ -219,11 +229,13 @@ impl Bridge {
 
                             // Request basic cluster attributes (manufacturer, model)
                             if input_clusters.contains(&0x0000) {
-                                let payload = zigbee2mqtt_rs::zigbee::zcl::frame::read_attributes_payload(
+                                let payload = crate::zigbee::zcl::frame::read_attributes_payload(
                                     &[0x0004, 0x0005, 0x0007, 0x4000],
                                 );
                                 trans_id = trans_id.wrapping_add(1);
-                                coord.send_zcl(nwk_addr, endpoint, 0x0000, trans_id, payload).await.ok();
+                                if let Err(e) = coord.send_zcl(nwk_addr, endpoint, 0x0000, trans_id, payload).await {
+                                    warn!("Failed to send ZCL read attributes: {e}");
+                                }
                             }
 
                             Self::publish_device_list_static(&devices, &mqtt).await;
@@ -244,7 +256,9 @@ impl Bridge {
                             // Unknown NWK? Request IEEE address to link it.
                             if devices.get_by_nwk(src_addr).is_none() {
                                 debug!("Unknown NWK 0x{src_addr:04X}, requesting IEEE address");
-                                coord.request_ieee_addr(src_addr).await.ok();
+                                if let Err(e) = coord.request_ieee_addr(src_addr).await {
+                                    warn!("Failed to request IEEE address: {e}");
+                                }
                             }
 
                             if cluster_id == 0x0000 {
@@ -260,7 +274,9 @@ impl Bridge {
                                         let state = serde_json::Value::Object(dev.state.clone());
                                         let name = dev.friendly_name.clone();
                                         drop(dev);
-                                        mqtt.publish_device_state(&name, &state).await.ok();
+                                        if let Err(e) = mqtt.publish_device_state(&name, &state).await {
+                                            warn!("Failed to publish device state: {e}");
+                                        }
                                     }
                                 }
                                 Ok(None) => {}
@@ -270,17 +286,21 @@ impl Bridge {
                     }
                 }
 
-                // ── MQTT commands ─────────────────────────────────────────────
+                // -- MQTT commands --
                 cmd = mqtt_rx.recv() => {
                     match cmd {
                         None => break,
                         Some(MqttCommand::PermitJoin { duration }) => {
                             info!("Permit join: {duration}s");
-                            coord.permit_join(duration).await.ok();
-                            mqtt.publish_bridge_log("info", &format!("Permit join: {duration}s")).await.ok();
+                            if let Err(e) = coord.permit_join(duration).await {
+                                warn!("Failed to set permit join: {e}");
+                            }
+                            if let Err(e) = mqtt.publish_bridge_log("info", &format!("Permit join: {duration}s")).await {
+                                warn!("Failed to publish bridge log: {e}");
+                            }
                         }
                         Some(MqttCommand::SetDevice { friendly_name, payload }) => {
-                            info!("MQTT set: {friendly_name} → {payload}");
+                            info!("MQTT set: {friendly_name} -> {payload}");
                             Self::handle_set(
                                 &devices, &coord, &mqtt, &mut trans_id,
                                 &friendly_name, &payload,
@@ -290,7 +310,9 @@ impl Bridge {
                             debug!("MQTT get: {friendly_name}");
                             if let Some(dev) = devices.find_by_name(&friendly_name) {
                                 let state = serde_json::Value::Object(dev.state);
-                                mqtt.publish_device_state(&friendly_name, &state).await.ok();
+                                if let Err(e) = mqtt.publish_device_state(&friendly_name, &state).await {
+                                    warn!("Failed to publish device state: {e}");
+                                }
                             } else {
                                 warn!("Get command for unknown device: {friendly_name}");
                             }
@@ -300,7 +322,9 @@ impl Bridge {
             }
         }
 
-        mqtt.publish_bridge_state(false).await.ok();
+        if let Err(e) = mqtt.publish_bridge_state(false).await {
+            warn!("Failed to publish offline state: {e}");
+        }
         Ok(())
     }
 
@@ -318,7 +342,7 @@ impl Bridge {
     /// Also pre-seeds stub entries for devices in config but not in database.
     fn apply_device_configs(&self) {
         for (ieee_str, cfg) in &self.cfg.devices {
-            if let Some(ieee) = parse_ieee_addr(ieee_str) {
+            if let Some(ieee) = IeeeAddr::from_hex(ieee_str) {
                 let name = cfg
                     .friendly_name
                     .clone()
@@ -343,7 +367,7 @@ impl Bridge {
         let coord_ieee = coord
             .info
             .ieee_addr
-            .map(|a| IeeeAddr(a).as_hex())
+            .map(|a| a.as_hex())
             .unwrap_or_default();
 
         let info = json!({
@@ -361,7 +385,9 @@ impl Bridge {
             "config": {},
         });
 
-        mqtt.publish_bridge_info(&info).await.ok();
+        if let Err(e) = mqtt.publish_bridge_info(&info).await {
+            warn!("Failed to publish bridge info: {e}");
+        }
     }
 
     async fn handle_set(
@@ -400,10 +426,12 @@ impl Bridge {
             if let Some(ep) = find_ep_with_cluster(&endpoints, 0x0006) {
                 if let Some(zcl_payload) = on_off::set_state_payload(*trans_id, state_str) {
                     *trans_id = trans_id.wrapping_add(1);
-                    coord
+                    if let Err(e) = coord
                         .send_zcl(nwk_addr, ep, 0x0006, *trans_id, zcl_payload)
                         .await
-                        .ok();
+                    {
+                        warn!("Failed to send on/off command: {e}");
+                    }
                     optimistic.insert("state".into(), json!(state_str.to_uppercase()));
                 }
             }
@@ -416,10 +444,12 @@ impl Bridge {
                 let transition = transition_time(payload);
                 let zcl_payload = level::move_to_level_payload(*trans_id, lvl, transition);
                 *trans_id = trans_id.wrapping_add(1);
-                coord
+                if let Err(e) = coord
                     .send_zcl(nwk_addr, ep, 0x0008, *trans_id, zcl_payload)
                     .await
-                    .ok();
+                {
+                    warn!("Failed to send level command: {e}");
+                }
                 optimistic.insert("brightness".into(), json!(lvl));
                 // Move-to-level-with-on/off implies state ON
                 if !optimistic.contains_key("state") {
@@ -435,10 +465,12 @@ impl Bridge {
                 let zcl_payload =
                     color::move_to_color_temp_payload(*trans_id, ct as u16, transition);
                 *trans_id = trans_id.wrapping_add(1);
-                coord
+                if let Err(e) = coord
                     .send_zcl(nwk_addr, ep, 0x0300, *trans_id, zcl_payload)
                     .await
-                    .ok();
+                {
+                    warn!("Failed to send color temp command: {e}");
+                }
                 optimistic.insert("color_temp".into(), json!(ct));
                 optimistic.insert("color_mode".into(), json!("color_temp"));
             }
@@ -456,10 +488,12 @@ impl Bridge {
                     let zcl_payload =
                         color::move_to_color_xy_payload(*trans_id, x, y, transition);
                     *trans_id = trans_id.wrapping_add(1);
-                    coord
+                    if let Err(e) = coord
                         .send_zcl(nwk_addr, ep, 0x0300, *trans_id, zcl_payload)
                         .await
-                        .ok();
+                    {
+                        warn!("Failed to send color XY command: {e}");
+                    }
                     optimistic.insert("color".into(), json!({"x": x, "y": y}));
                     optimistic.insert("color_mode".into(), json!("xy"));
                 } else if let (Some(h), Some(s)) = (
@@ -471,10 +505,12 @@ impl Bridge {
                     let zcl_payload =
                         color::move_to_hue_sat_payload(*trans_id, zcl_hue, zcl_sat, transition);
                     *trans_id = trans_id.wrapping_add(1);
-                    coord
+                    if let Err(e) = coord
                         .send_zcl(nwk_addr, ep, 0x0300, *trans_id, zcl_payload)
                         .await
-                        .ok();
+                    {
+                        warn!("Failed to send color HS command: {e}");
+                    }
                     optimistic
                         .insert("color".into(), json!({"hue": h, "saturation": s}));
                     optimistic.insert("color_mode".into(), json!("hs"));
@@ -493,7 +529,9 @@ impl Bridge {
             // Publish the full merged state
             if let Some(dev) = devices.find_by_name(name) {
                 let full_state = serde_json::Value::Object(dev.state);
-                mqtt.publish_device_state(name, &full_state).await.ok();
+                if let Err(e) = mqtt.publish_device_state(name, &full_state).await {
+                    warn!("Failed to publish device state: {e}");
+                }
             }
         }
     }
@@ -545,7 +583,9 @@ impl Bridge {
             .iter()
             .map(|d| d.to_z2m_device_json())
             .collect();
-        mqtt.publish_bridge_devices(&json!(list)).await.ok();
+        if let Err(e) = mqtt.publish_bridge_devices(&json!(list)).await {
+            warn!("Failed to publish device list: {e}");
+        }
     }
 }
 
@@ -560,7 +600,7 @@ fn transition_time(payload: &serde_json::Value) -> u16 {
     payload
         .get("transition")
         .and_then(|v| v.as_f64())
-        .map(|s| (s * 10.0) as u16)
+        .map(|s| (s.max(0.0) * 10.0).min(65535.0) as u16)
         .unwrap_or(0)
 }
 
@@ -597,39 +637,26 @@ fn days_to_ymd(days_since_epoch: u64) -> (u64, u64, u64) {
     (y, m, d)
 }
 
-/// Parse an IEEE address string like "0xAABBCCDDEEFF0011" to IeeeAddr.
-fn parse_ieee_addr(s: &str) -> Option<IeeeAddr> {
-    let hex = s.trim_start_matches("0x").trim_start_matches("0X");
-    if hex.len() != 16 {
-        return None;
-    }
-    let mut bytes = [0u8; 8];
-    for i in 0..8 {
-        bytes[7 - i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
-    }
-    Some(IeeeAddr(bytes))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn parse_ieee_addr_valid() {
-        let addr = parse_ieee_addr("0x00158D0001020304").unwrap();
+        let addr = IeeeAddr::from_hex("0x00158D0001020304").unwrap();
         assert_eq!(addr.as_hex(), "0x00158d0001020304");
     }
 
     #[test]
     fn parse_ieee_addr_lowercase() {
-        let addr = parse_ieee_addr("0xec1bbdfffeaa66db").unwrap();
+        let addr = IeeeAddr::from_hex("0xec1bbdfffeaa66db").unwrap();
         assert_eq!(addr.as_hex().to_lowercase(), "0xec1bbdfffeaa66db");
     }
 
     #[test]
     fn parse_ieee_addr_invalid() {
-        assert!(parse_ieee_addr("0x1234").is_none());
-        assert!(parse_ieee_addr("not_hex").is_none());
+        assert!(IeeeAddr::from_hex("0x1234").is_none());
+        assert!(IeeeAddr::from_hex("not_hex").is_none());
     }
 
     #[test]

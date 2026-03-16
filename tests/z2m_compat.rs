@@ -154,7 +154,6 @@ mod bridge_devices {
 
 mod receive_state {
     //! Tests from receive.test.ts — device state publishing format
-    use serde_json::json;
     use zigbee2mqtt_rs::zigbee::zcl;
 
     #[test]

@@ -18,7 +18,7 @@ pub enum Error {
     Serde(#[from] serde_json::Error),
 
     #[error("YAML error: {0}")]
-    Yaml(#[from] serde_yaml::Error),
+    Yaml(#[from] serde_yml::Error),
 
     #[error("ZNP protocol error: {0}")]
     Znp(String),

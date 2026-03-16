@@ -57,10 +57,9 @@ impl MqttBridge {
 
         let base_topic = cfg.base_topic.clone();
         let client_clone = client.clone();
-        let cmd_tx_clone = cmd_tx.clone();
 
         tokio::spawn(async move {
-            run_event_loop(event_loop, client_clone, &base_topic, cmd_tx_clone).await;
+            run_event_loop(event_loop, client_clone, &base_topic, cmd_tx).await;
         });
 
         Ok((

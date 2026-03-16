@@ -154,15 +154,7 @@ pub fn load_database(
 }
 
 fn parse_ieee(s: &str) -> Option<IeeeAddr> {
-    let hex = s.trim_start_matches("0x").trim_start_matches("0X");
-    if hex.len() != 16 {
-        return None;
-    }
-    let mut bytes = [0u8; 8];
-    for i in 0..8 {
-        bytes[7 - i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
-    }
-    Some(IeeeAddr(bytes))
+    IeeeAddr::from_hex(s)
 }
 
 /// Find the database.db file. Checks common locations relative to the config file.

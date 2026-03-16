@@ -7,6 +7,20 @@ use serde::{Deserialize, Serialize};
 pub struct IeeeAddr(pub [u8; 8]);
 
 impl IeeeAddr {
+    #[must_use]
+    pub fn from_hex(s: &str) -> Option<IeeeAddr> {
+        let hex = s.trim_start_matches("0x").trim_start_matches("0X");
+        if hex.len() != 16 {
+            return None;
+        }
+        let mut bytes = [0u8; 8];
+        for i in 0..8 {
+            bytes[7 - i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
+        }
+        Some(IeeeAddr(bytes))
+    }
+
+    #[must_use]
     pub fn as_hex(&self) -> String {
         format!(
             "0x{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
