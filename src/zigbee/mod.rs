@@ -9,7 +9,7 @@ pub struct IeeeAddr(pub [u8; 8]);
 impl IeeeAddr {
     pub fn as_hex(&self) -> String {
         format!(
-            "0x{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+            "0x{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
             self.0[7], self.0[6], self.0[5], self.0[4],
             self.0[3], self.0[2], self.0[1], self.0[0],
         )

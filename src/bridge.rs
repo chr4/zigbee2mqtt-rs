@@ -161,7 +161,12 @@ impl Bridge {
                         }) => {
                             debug!("AF msg from 0x{src_addr:04X} ep={src_ep} cluster=0x{cluster_id:04X} lqi={link_quality}");
 
-                            // Handle basic cluster responses to update device metadata
+                            // Unknown NWK? Trigger discovery so we learn about it.
+                            if devices.get_by_nwk(src_addr).is_none() {
+                                debug!("Unknown NWK 0x{src_addr:04X}, requesting discovery");
+                                coord.request_active_eps(src_addr).await.ok();
+                            }
+
                             if cluster_id == 0x0000 {
                                 Self::handle_basic_cluster_response(&devices, src_addr, &data);
                             }
@@ -170,7 +175,6 @@ impl Bridge {
                                 Ok(Some(zcl_msg)) => {
                                     if let Some(mut dev) = devices.get_mut_by_nwk(src_addr) {
                                         dev.merge_state(zcl_msg.values.clone());
-                                        // Add linkquality and last_seen (z2m compatibility)
                                         dev.state.insert("linkquality".into(), json!(link_quality));
                                         dev.state.insert("last_seen".into(), json!(now_iso8601()));
                                         let state = serde_json::Value::Object(dev.state.clone());
@@ -216,18 +220,26 @@ impl Bridge {
         Ok(())
     }
 
-    /// Apply friendly names and settings from config to pre-seed the device registry.
+    /// Pre-seed the device registry from config so devices are findable by
+    /// friendly name even before they re-announce on the network.
     fn apply_device_configs(&self) {
         for (ieee_str, cfg) in &self.cfg.devices {
-            if let Some(name) = &cfg.friendly_name {
-                // Parse IEEE address from config key
-                if let Some(ieee) = parse_ieee_addr(ieee_str) {
-                    // If device already exists (from persistence), update name
-                    if let Some(mut dev) = self.devices.get_mut_by_ieee(&ieee) {
-                        dev.friendly_name = name.clone();
-                        dev.disabled = cfg.disabled.unwrap_or(false);
-                    }
-                    // Otherwise it will be applied when the device joins
+            if let Some(ieee) = parse_ieee_addr(ieee_str) {
+                let name = cfg
+                    .friendly_name
+                    .clone()
+                    .unwrap_or_else(|| ieee.as_hex());
+                let disabled = cfg.disabled.unwrap_or(false);
+
+                if let Some(mut dev) = self.devices.get_mut_by_ieee(&ieee) {
+                    dev.friendly_name = name;
+                    dev.disabled = disabled;
+                } else {
+                    // Pre-seed: create a stub device with NWK=0 (updated on join)
+                    let mut dev = Device::new(ieee, 0);
+                    dev.friendly_name = name;
+                    dev.disabled = disabled;
+                    self.devices.add(dev);
                 }
             }
         }
@@ -272,6 +284,14 @@ impl Bridge {
                 return;
             }
         };
+
+        if dev.nwk_addr == 0 || !dev.interview_complete {
+            warn!(
+                "Device {name} not yet available on network (nwk=0x{:04X}, interviewed={})",
+                dev.nwk_addr, dev.interview_complete
+            );
+            return;
+        }
 
         let nwk_addr = dev.nwk_addr;
         let endpoints = &dev.endpoints;
@@ -471,7 +491,7 @@ mod tests {
     #[test]
     fn parse_ieee_addr_valid() {
         let addr = parse_ieee_addr("0x00158D0001020304").unwrap();
-        assert_eq!(addr.as_hex(), "0x00158D0001020304");
+        assert_eq!(addr.as_hex(), "0x00158d0001020304");
     }
 
     #[test]
