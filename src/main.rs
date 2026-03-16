@@ -55,7 +55,7 @@ async fn main() {
         cfg.mqtt.port
     );
 
-    let bridge = bridge::Bridge::new(cfg);
+    let bridge = bridge::Bridge::new(cfg, args.config.clone());
 
     if let Err(e) = bridge.run().await {
         error!("Bridge error: {e}");
