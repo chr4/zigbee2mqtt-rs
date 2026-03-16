@@ -122,7 +122,7 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)
             .map_err(|e| Error::Config(format!("cannot read {}: {e}", path.display())))?;
-        let config: Config = serde_yaml::from_str(&content)?;
+        let config: Config = serde_yml::from_str(&content)?;
         config.validate()?;
         Ok(config)
     }

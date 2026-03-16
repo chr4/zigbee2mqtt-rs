@@ -17,6 +17,7 @@ pub struct ZclMessage {
 }
 
 /// Parse a raw ZCL payload (bytes from AF_INCOMING_MSG) and produce a `ZclMessage`.
+#[must_use]
 pub fn parse_message(cluster_id: u16, raw: &[u8]) -> Result<Option<ZclMessage>> {
     let (header, payload_offset) = ZclFrameHeader::parse(raw)?;
 

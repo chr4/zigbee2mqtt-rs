@@ -26,7 +26,7 @@ impl FrameType {
             1 => Self::SReq,
             2 => Self::AReq,
             3 => Self::SRsp,
-            _ => unreachable!(),
+            _ => Self::Poll,
         }
     }
 }

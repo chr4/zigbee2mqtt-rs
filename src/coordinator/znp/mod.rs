@@ -14,6 +14,7 @@ use transport::{ZnpEvent, ZnpTransport};
 use crate::config::Config;
 use crate::coordinator::{CoordinatorEvent, CoordinatorHandle, CoordinatorInfo};
 use crate::error::{Error, Result};
+use crate::zigbee::IeeeAddr;
 
 pub struct ZnpCoordinator {
     transport: ZnpTransport,
@@ -44,7 +45,7 @@ impl ZnpCoordinator {
         info!("ZNP coordinator ready");
 
         let coord_info = CoordinatorInfo {
-            ieee_addr: device_info.as_ref().map(|d| d.ieee_addr),
+            ieee_addr: device_info.as_ref().map(|d| IeeeAddr(d.ieee_addr)),
             version: format!("{}.{}", version.major_rel, version.minor_rel),
             transport_rev: version.transport_rev,
         };
@@ -235,13 +236,13 @@ async fn event_pump(mut znp_rx: mpsc::Receiver<ZnpEvent>, out: mpsc::Sender<Coor
         let coord_event = match ev {
             ZnpEvent::EndDeviceAnnceInd(data) => {
                 EndDeviceAnnceInd::parse(&data).map(|d| CoordinatorEvent::DeviceJoined {
-                    ieee_addr: d.ieee_addr,
+                    ieee_addr: IeeeAddr(d.ieee_addr),
                     nwk_addr: d.nwk_addr,
                 })
             }
             ZnpEvent::LeaveInd(data) => {
                 LeaveInd::parse(&data).map(|d| CoordinatorEvent::DeviceLeft {
-                    ieee_addr: d.ieee_addr,
+                    ieee_addr: IeeeAddr(d.ieee_addr),
                 })
             }
             ZnpEvent::AfIncomingMsg(data) => {
@@ -271,7 +272,7 @@ async fn event_pump(mut znp_rx: mpsc::Receiver<ZnpEvent>, out: mpsc::Sender<Coor
             }
             ZnpEvent::IeeeAddrRsp(data) => {
                 IeeeAddrRsp::parse(&data).map(|r| CoordinatorEvent::AddressResolved {
-                    ieee_addr: r.ieee_addr,
+                    ieee_addr: IeeeAddr(r.ieee_addr),
                     nwk_addr: r.nwk_addr,
                 })
             }
@@ -282,7 +283,7 @@ async fn event_pump(mut znp_rx: mpsc::Receiver<ZnpEvent>, out: mpsc::Sender<Coor
                     let mut ieee = [0u8; 8];
                     ieee.copy_from_slice(&data[2..10]);
                     Some(CoordinatorEvent::AddressResolved {
-                        ieee_addr: ieee,
+                        ieee_addr: IeeeAddr(ieee),
                         nwk_addr,
                     })
                 } else {

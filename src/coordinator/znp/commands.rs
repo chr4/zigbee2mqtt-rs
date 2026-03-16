@@ -353,7 +353,7 @@ impl SimpleDescRsp {
         pos += 1;
         let mut input_clusters = Vec::with_capacity(n_in);
         for _ in 0..n_in {
-            if pos + 1 >= data.len() {
+            if pos + 2 > data.len() {
                 return None;
             }
             input_clusters.push(u16::from_le_bytes([data[pos], data[pos + 1]]));
@@ -363,7 +363,7 @@ impl SimpleDescRsp {
         pos += 1;
         let mut output_clusters = Vec::with_capacity(n_out);
         for _ in 0..n_out {
-            if pos + 1 >= data.len() {
+            if pos + 2 > data.len() {
                 return None;
             }
             output_clusters.push(u16::from_le_bytes([data[pos], data[pos + 1]]));

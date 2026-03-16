@@ -26,18 +26,18 @@ pub trait ClusterHandler: Send + Sync {
 }
 
 /// Return a handler for the given cluster_id, or None if unsupported.
-pub fn handler_for(cluster_id: u16) -> Option<Box<dyn ClusterHandler>> {
+pub fn handler_for(cluster_id: u16) -> Option<&'static dyn ClusterHandler> {
     match cluster_id {
-        0x0000 => Some(Box::new(basic::BasicCluster)),
-        0x0001 => Some(Box::new(power::PowerCluster)),
-        0x0006 => Some(Box::new(on_off::OnOffCluster)),
-        0x0008 => Some(Box::new(level::LevelCluster)),
-        0x0300 => Some(Box::new(color::ColorCluster)),
-        0x0400 => Some(Box::new(illuminance::IlluminanceCluster)),
-        0x0402 => Some(Box::new(temperature::TemperatureCluster)),
-        0x0405 => Some(Box::new(humidity::HumidityCluster)),
-        0x0406 => Some(Box::new(occupancy::OccupancyCluster)),
-        0x0500 => Some(Box::new(ias_zone::IasZoneCluster)),
+        0x0000 => Some(&basic::BasicCluster),
+        0x0001 => Some(&power::PowerCluster),
+        0x0006 => Some(&on_off::OnOffCluster),
+        0x0008 => Some(&level::LevelCluster),
+        0x0300 => Some(&color::ColorCluster),
+        0x0400 => Some(&illuminance::IlluminanceCluster),
+        0x0402 => Some(&temperature::TemperatureCluster),
+        0x0405 => Some(&humidity::HumidityCluster),
+        0x0406 => Some(&occupancy::OccupancyCluster),
+        0x0500 => Some(&ias_zone::IasZoneCluster),
         _ => None,
     }
 }
