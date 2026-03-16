@@ -51,3 +51,73 @@ pub fn set_state_payload(sequence: u8, state: &str) -> Option<Vec<u8>> {
     // Cluster-specific, client→server, no mfr, disable default response
     Some(vec![0x11, sequence, cmd])
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::zigbee::zcl::attribute::{AttributeReport, AttributeValue};
+
+    #[test]
+    fn on_report() {
+        let reports = vec![AttributeReport {
+            attr_id: 0x0000,
+            value: AttributeValue::Bool(true),
+        }];
+        let result = OnOffCluster.process_reports(&reports);
+        assert_eq!(result, vec![("state".into(), json!("ON"))]);
+    }
+
+    #[test]
+    fn off_report() {
+        let reports = vec![AttributeReport {
+            attr_id: 0x0000,
+            value: AttributeValue::Bool(false),
+        }];
+        let result = OnOffCluster.process_reports(&reports);
+        assert_eq!(result, vec![("state".into(), json!("OFF"))]);
+    }
+
+    #[test]
+    fn command_on_off_toggle() {
+        assert_eq!(
+            OnOffCluster.process_command(0x00, &[]),
+            vec![("state".into(), json!("OFF"))]
+        );
+        assert_eq!(
+            OnOffCluster.process_command(0x01, &[]),
+            vec![("state".into(), json!("ON"))]
+        );
+        assert_eq!(
+            OnOffCluster.process_command(0x02, &[]),
+            vec![("state".into(), json!("TOGGLE"))]
+        );
+    }
+
+    #[test]
+    fn set_state_payload_on() {
+        let p = set_state_payload(5, "ON").unwrap();
+        assert_eq!(p, vec![0x11, 5, 0x01]);
+    }
+
+    #[test]
+    fn set_state_payload_off() {
+        let p = set_state_payload(0, "OFF").unwrap();
+        assert_eq!(p, vec![0x11, 0, 0x00]);
+    }
+
+    #[test]
+    fn set_state_payload_toggle() {
+        assert!(set_state_payload(0, "TOGGLE").is_some());
+    }
+
+    #[test]
+    fn set_state_payload_case_insensitive() {
+        assert!(set_state_payload(0, "on").is_some());
+        assert!(set_state_payload(0, "Off").is_some());
+    }
+
+    #[test]
+    fn set_state_payload_invalid() {
+        assert!(set_state_payload(0, "blah").is_none());
+    }
+}

@@ -96,3 +96,78 @@ fn parse_read_attr_rsp(buf: &[u8]) -> Vec<AttributeReport> {
     }
     reports
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_on_off_report_attributes() {
+        // ZCL frame: global, client→server, seq=1, cmd=0x0A (Report Attributes)
+        // Report: attr_id=0x0000, type=Boolean(0x10), value=0x01 (ON)
+        #[rustfmt::skip]
+        let raw = [
+            0x18, // frame control: global, server→client, disable default rsp
+            0x01, // sequence
+            0x0A, // command: Report Attributes
+            0x00, 0x00, // attr_id = 0x0000
+            0x10,       // data_type = Boolean
+            0x01,       // value = true
+        ];
+        let msg = parse_message(0x0006, &raw).unwrap().unwrap();
+        assert_eq!(msg.values["state"], "ON");
+    }
+
+    #[test]
+    fn parse_temperature_report() {
+        #[rustfmt::skip]
+        let raw = [
+            0x18, 0x01, 0x0A, // header: global, report attributes
+            0x00, 0x00,       // attr_id = 0x0000
+            0x29,             // data_type = Int16
+            0xCA, 0x08,       // value = 2250 (22.50°C)
+        ];
+        let msg = parse_message(0x0402, &raw).unwrap().unwrap();
+        assert_eq!(msg.values["temperature"], 22.5);
+    }
+
+    #[test]
+    fn parse_unsupported_cluster() {
+        let raw = [0x18, 0x01, 0x0A, 0x00, 0x00, 0x10, 0x01];
+        let result = parse_message(0xFFFF, &raw).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn parse_read_attr_rsp_basic_cluster() {
+        // Read Attributes Response for basic cluster (manufacturer + model)
+        #[rustfmt::skip]
+        let raw = [
+            0x18, 0x01, 0x01, // header: global, Read Attributes Response
+            // Attribute 0x0004 (manufacturer), status=OK, type=CharStr
+            0x04, 0x00, 0x00, 0x42, 0x04, b'I', b'K', b'E', b'A',
+            // Attribute 0x0005 (model), status=OK, type=CharStr
+            0x05, 0x00, 0x00, 0x42, 0x05, b'B', b'U', b'L', b'B', b'1',
+        ];
+        let msg = parse_message(0x0000, &raw).unwrap().unwrap();
+        assert_eq!(msg.values["manufacturer"], "IKEA");
+        assert_eq!(msg.values["model"], "BULB1");
+    }
+
+    #[test]
+    fn parse_cluster_specific_on_off() {
+        // Cluster-specific On command
+        let raw = [
+            0x01, // frame control: cluster-specific, client→server
+            0x01, // sequence
+            0x01, // command: On
+        ];
+        let msg = parse_message(0x0006, &raw).unwrap().unwrap();
+        assert_eq!(msg.values["state"], "ON");
+    }
+
+    #[test]
+    fn empty_zcl_frame_errors() {
+        assert!(parse_message(0x0006, &[]).is_err());
+    }
+}

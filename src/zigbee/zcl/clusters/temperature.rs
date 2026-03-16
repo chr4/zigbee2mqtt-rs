@@ -33,3 +33,41 @@ impl ClusterHandler for TemperatureCluster {
         out
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::zigbee::zcl::attribute::{AttributeReport, AttributeValue};
+
+    #[test]
+    fn temperature_report() {
+        let reports = vec![AttributeReport {
+            attr_id: 0x0000,
+            value: AttributeValue::I16(2250), // 22.50°C
+        }];
+        let result = TemperatureCluster.process_reports(&reports);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, "temperature");
+        assert_eq!(result[0].1, json!(22.5));
+    }
+
+    #[test]
+    fn temperature_invalid_value() {
+        let reports = vec![AttributeReport {
+            attr_id: 0x0000,
+            value: AttributeValue::I16(-32768), // 0x8000 = invalid
+        }];
+        let result = TemperatureCluster.process_reports(&reports);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn temperature_negative() {
+        let reports = vec![AttributeReport {
+            attr_id: 0x0000,
+            value: AttributeValue::I16(-500), // -5.00°C
+        }];
+        let result = TemperatureCluster.process_reports(&reports);
+        assert_eq!(result[0].1, json!(-5.0));
+    }
+}

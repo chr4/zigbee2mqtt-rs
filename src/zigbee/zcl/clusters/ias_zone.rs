@@ -56,9 +56,55 @@ impl ClusterHandler for IasZoneCluster {
 
 fn decode_zone_status(status: u16) -> Vec<(String, Value)> {
     vec![
-        ("contact".into(),     json!((status & ALARM1) == 0)),  // contact closed = no alarm
-        ("tamper".into(),      json!((status & TAMPER) != 0)),
+        ("contact".into(), json!((status & ALARM1) == 0)), // contact closed = no alarm
+        ("tamper".into(), json!((status & TAMPER) != 0)),
         ("battery_low".into(), json!((status & BATTERY) != 0)),
-        ("trouble".into(),     json!((status & TROUBLE) != 0)),
+        ("trouble".into(), json!((status & TROUBLE) != 0)),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::zigbee::zcl::attribute::{AttributeReport, AttributeValue};
+
+    #[test]
+    fn zone_status_closed() {
+        let reports = vec![AttributeReport {
+            attr_id: ZONE_STATUS,
+            value: AttributeValue::U16(0x0000), // all clear
+        }];
+        let result = IasZoneCluster.process_reports(&reports);
+        assert!(result.iter().any(|(k, v)| k == "contact" && v == &json!(true)));
+        assert!(result.iter().any(|(k, v)| k == "tamper" && v == &json!(false)));
+    }
+
+    #[test]
+    fn zone_status_open() {
+        let reports = vec![AttributeReport {
+            attr_id: ZONE_STATUS,
+            value: AttributeValue::U16(0x0001), // ALARM1 = open
+        }];
+        let result = IasZoneCluster.process_reports(&reports);
+        assert!(result.iter().any(|(k, v)| k == "contact" && v == &json!(false)));
+    }
+
+    #[test]
+    fn zone_status_tamper() {
+        let reports = vec![AttributeReport {
+            attr_id: ZONE_STATUS,
+            value: AttributeValue::U16(0x0004), // TAMPER
+        }];
+        let result = IasZoneCluster.process_reports(&reports);
+        assert!(result.iter().any(|(k, v)| k == "tamper" && v == &json!(true)));
+    }
+
+    #[test]
+    fn zone_status_change_notification() {
+        // Command 0x00 with zone_status = open + tamper
+        let payload = [0x05, 0x00, 0x00, 0x01, 0x00, 0x00]; // status=0x0005
+        let result = IasZoneCluster.process_command(0x00, &payload);
+        assert!(result.iter().any(|(k, v)| k == "contact" && v == &json!(false)));
+        assert!(result.iter().any(|(k, v)| k == "tamper" && v == &json!(true)));
+    }
 }

@@ -216,3 +216,123 @@ impl AttributeReport {
         reports
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_bool_true() {
+        let (val, consumed) = AttributeValue::parse(DataType::Boolean, &[0x01]).unwrap();
+        assert_eq!(consumed, 1);
+        assert_eq!(val.as_bool(), Some(true));
+    }
+
+    #[test]
+    fn parse_bool_false() {
+        let (val, _) = AttributeValue::parse(DataType::Boolean, &[0x00]).unwrap();
+        assert_eq!(val.as_bool(), Some(false));
+    }
+
+    #[test]
+    fn parse_u8() {
+        let (val, consumed) = AttributeValue::parse(DataType::Uint8, &[0xFF]).unwrap();
+        assert_eq!(consumed, 1);
+        assert_eq!(val.as_f64(), Some(255.0));
+    }
+
+    #[test]
+    fn parse_u16() {
+        let (val, consumed) = AttributeValue::parse(DataType::Uint16, &[0x34, 0x12]).unwrap();
+        assert_eq!(consumed, 2);
+        assert_eq!(val.as_f64(), Some(0x1234 as f64));
+    }
+
+    #[test]
+    fn parse_i16_negative() {
+        let bytes = (-500i16).to_le_bytes();
+        let (val, consumed) = AttributeValue::parse(DataType::Int16, &bytes).unwrap();
+        assert_eq!(consumed, 2);
+        assert_eq!(val.as_f64(), Some(-500.0));
+    }
+
+    #[test]
+    fn parse_char_str() {
+        let buf = [5, b'H', b'e', b'l', b'l', b'o'];
+        let (val, consumed) = AttributeValue::parse(DataType::CharStr, &buf).unwrap();
+        assert_eq!(consumed, 6);
+        if let AttributeValue::Str(s) = val {
+            assert_eq!(s, "Hello");
+        } else {
+            panic!("Expected Str");
+        }
+    }
+
+    #[test]
+    fn parse_char_str_empty() {
+        let (val, consumed) = AttributeValue::parse(DataType::CharStr, &[0]).unwrap();
+        assert_eq!(consumed, 1);
+        if let AttributeValue::Str(s) = val {
+            assert_eq!(s, "");
+        } else {
+            panic!("Expected Str");
+        }
+    }
+
+    #[test]
+    fn parse_char_str_invalid_length() {
+        let (val, consumed) = AttributeValue::parse(DataType::CharStr, &[0xFF]).unwrap();
+        assert_eq!(consumed, 1);
+        assert!(matches!(val, AttributeValue::Invalid));
+    }
+
+    #[test]
+    fn parse_u24() {
+        let (val, consumed) = AttributeValue::parse(DataType::Uint24, &[0x01, 0x02, 0x03]).unwrap();
+        assert_eq!(consumed, 3);
+        assert_eq!(val.as_f64(), Some(0x030201 as f64));
+    }
+
+    #[test]
+    fn parse_u32() {
+        let (val, consumed) =
+            AttributeValue::parse(DataType::Uint32, &[0x01, 0x00, 0x00, 0x00]).unwrap();
+        assert_eq!(consumed, 4);
+        assert_eq!(val.as_f64(), Some(1.0));
+    }
+
+    #[test]
+    fn parse_truncated_errors() {
+        assert!(AttributeValue::parse(DataType::Uint16, &[0x01]).is_err());
+        assert!(AttributeValue::parse(DataType::Boolean, &[]).is_err());
+    }
+
+    #[test]
+    fn parse_all_multiple_reports() {
+        #[rustfmt::skip]
+        let buf = [
+            0x00, 0x00, // attr_id = 0x0000
+            0x10,       // data_type = Boolean
+            0x01,       // value = true
+            0x01, 0x00, // attr_id = 0x0001
+            0x20,       // data_type = Uint8
+            0xFE,       // value = 254
+        ];
+        let reports = AttributeReport::parse_all(&buf);
+        assert_eq!(reports.len(), 2);
+        assert_eq!(reports[0].attr_id, 0x0000);
+        assert_eq!(reports[0].value.as_bool(), Some(true));
+        assert_eq!(reports[1].attr_id, 0x0001);
+        assert_eq!(reports[1].value.as_f64(), Some(254.0));
+    }
+
+    #[test]
+    fn data_type_fixed_len() {
+        assert_eq!(DataType::Boolean.fixed_len(), Some(1));
+        assert_eq!(DataType::Uint16.fixed_len(), Some(2));
+        assert_eq!(DataType::Uint32.fixed_len(), Some(4));
+        assert_eq!(DataType::Double.fixed_len(), Some(8));
+        assert_eq!(DataType::CharStr.fixed_len(), None);
+        assert_eq!(DataType::OctetStr.fixed_len(), None);
+    }
+}
