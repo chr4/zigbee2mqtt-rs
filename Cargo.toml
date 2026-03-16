@@ -20,8 +20,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 
-# MQTT
-rumqttc = "0.24"
+# MQTT — disable default TLS feature (uses ring/C); we connect over plain TCP
+rumqttc = { version = "0.24", default-features = false }
 
 # Byte buffers
 bytes = "1"
