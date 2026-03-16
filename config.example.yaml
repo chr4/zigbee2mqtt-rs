@@ -1,0 +1,45 @@
+# zigbee2mqtt-rs configuration example
+# Copy to configuration.yaml and adjust as needed.
+
+# Serial port settings
+serial:
+  port: /dev/ttyACM0
+  baudrate: 115200
+  # Adapter type: znp (TI CC2531/CC2652), ezsp (Silicon Labs), auto
+  adapter: znp
+  rtscts: false
+
+# MQTT broker settings
+mqtt:
+  server: 10.5.9.1
+  port: 1883
+  base_topic: zigbee2mqtt-rs
+  client_id: zigbee2mqtt-rs
+  # Uncomment for authentication:
+  # username: my_user
+  # password: my_password
+  keepalive: 60
+
+# Allow new devices to join the network on startup.
+# Set to false after your devices are paired.
+permit_join: true
+
+# Publish Home Assistant MQTT auto-discovery messages.
+homeassistant: true
+
+devices:
+  '0xec1bbdfffeaa66db':
+    friendly_name: '0xec1bbdfffeaa66db'
+  '0x680ae2fffea72838':
+    friendly_name: '0x680ae2fffea72838'
+  '0xcc86ecfffe9fd1b1':
+    friendly_name: '0xcc86ecfffe9fd1b1'
+  '0x7cb03eaa0a00c4f8':
+    friendly_name: '0x7cb03eaa0a00c4f8'
+  '0x680ae2fffe0b84d7':
+    friendly_name: '0x680ae2fffe0b84d7'
+  '0x588e81fffe3ef07c':
+    friendly_name: '0x588e81fffe3ef07c'
+  '0x54ef44100152801e':
+    friendly_name: '0x54ef44100152801e'
+
