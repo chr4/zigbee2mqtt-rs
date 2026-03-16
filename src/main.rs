@@ -3,6 +3,7 @@ mod config;
 mod coordinator;
 mod devices;
 mod error;
+mod homeassistant;
 mod mqtt;
 mod zigbee;
 
@@ -31,7 +32,6 @@ struct Args {
 async fn main() {
     let args = Args::parse();
 
-    // Load config (provides log level before subscriber init)
     let cfg = match Config::load(&args.config) {
         Ok(c) => c,
         Err(e) => {
@@ -40,8 +40,9 @@ async fn main() {
         }
     };
 
-    // Init tracing
-    let log_level = args.log_level.as_deref()
+    let log_level = args
+        .log_level
+        .as_deref()
         .or(Some(cfg.advanced.log_level.as_str()))
         .unwrap_or("info");
 
@@ -54,8 +55,13 @@ async fn main() {
         .compact()
         .init();
 
-    tracing::info!("zigbee2mqtt-rs starting (serial={}, mqtt={}:{})",
-        cfg.serial.port, cfg.mqtt.server, cfg.mqtt.port);
+    tracing::info!(
+        "zigbee2mqtt-rs v{} starting (serial={}, mqtt={}:{})",
+        env!("CARGO_PKG_VERSION"),
+        cfg.serial.port,
+        cfg.mqtt.server,
+        cfg.mqtt.port
+    );
 
     let bridge = Bridge::new(cfg);
 
