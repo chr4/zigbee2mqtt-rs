@@ -33,8 +33,11 @@ impl ZnpCoordinator {
     pub async fn start(mut self, cfg: &Config) -> Result<CoordinatorHandle> {
         self.reset().await?;
         let version = self.check_version().await?;
+        let is_zstack3 = version.product_id >= 1;
         self.write_nv_config(cfg).await?;
-        self.configure_channel(cfg).await?;
+        if is_zstack3 {
+            self.configure_channel_bdb(cfg).await?;
+        }
         self.register_endpoints().await?;
         self.start_network().await?;
         let device_info = self.get_device_info().await;
@@ -149,7 +152,7 @@ impl ZnpCoordinator {
         Ok(())
     }
 
-    async fn configure_channel(&self, cfg: &Config) -> Result<()> {
+    async fn configure_channel_bdb(&self, cfg: &Config) -> Result<()> {
         let channel = cfg.advanced.channel;
         let channel_mask: u32 = 1 << channel;
 

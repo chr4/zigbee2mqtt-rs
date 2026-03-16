@@ -103,15 +103,28 @@ impl TransportActor {
         trace!(?frame, "← ZNP recv");
 
         if frame.frame_type == FrameType::SRsp {
-            // Match against a pending SREQ
             if let Some((expected_sub, expected_cmd1, _)) = &self.pending {
                 if frame.subsystem as u8 == *expected_sub && frame.cmd1 == *expected_cmd1 {
                     let (_, _, reply_tx) = self.pending.take().unwrap();
                     let _ = reply_tx.send(Ok(frame));
                     return;
                 }
+                // Mismatched subsystem but there's a pending request — deliver it
+                // anyway. Z-Stack 1.2 may return subsystem 0 for errors.
+                if frame.cmd1 == *expected_cmd1 {
+                    warn!(
+                        "SRSP subsystem mismatch: expected 0x{:02X} got 0x{:02X}, delivering anyway",
+                        expected_sub, frame.subsystem as u8
+                    );
+                    let (_, _, reply_tx) = self.pending.take().unwrap();
+                    let _ = reply_tx.send(Ok(frame));
+                    return;
+                }
             }
-            warn!("Unexpected SRSP sub=0x{:02X} cmd1=0x{:02X}", frame.subsystem as u8, frame.cmd1);
+            warn!(
+                "Unexpected SRSP sub=0x{:02X} cmd1=0x{:02X}",
+                frame.subsystem as u8, frame.cmd1
+            );
             return;
         }
 
