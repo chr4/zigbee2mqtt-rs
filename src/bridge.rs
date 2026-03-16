@@ -106,6 +106,31 @@ impl Bridge {
                             Self::publish_device_list_static(&devices, &mqtt).await;
                         }
 
+                        Some(CoordinatorEvent::AddressResolved { ieee_addr, nwk_addr }) => {
+                            let ieee = IeeeAddr(ieee_addr);
+                            debug!("Address resolved: {ieee} → 0x{nwk_addr:04X}");
+
+                            let known = devices.get_by_ieee(&ieee).is_some();
+                            if known {
+                                info!("Linking {ieee} to NWK 0x{nwk_addr:04X}");
+                                devices.update_nwk_addr(&ieee, nwk_addr);
+                            } else {
+                                // Unknown IEEE — create a new device entry
+                                let mut dev = Device::new(ieee, nwk_addr);
+                                if let Some(cfg) = device_configs.get(&ieee.as_hex()) {
+                                    if let Some(ref name) = cfg.friendly_name {
+                                        dev.friendly_name = name.clone();
+                                    }
+                                }
+                                devices.add(dev);
+                            }
+
+                            // Trigger interview if not done yet
+                            if devices.get_by_ieee(&ieee).map_or(false, |d| !d.interview_complete) {
+                                coord.request_active_eps(nwk_addr).await.ok();
+                            }
+                        }
+
                         Some(CoordinatorEvent::ActiveEpRsp { nwk_addr, endpoints }) => {
                             debug!("Active EPs for 0x{nwk_addr:04X}: {endpoints:?}");
                             for ep in endpoints {
@@ -161,10 +186,10 @@ impl Bridge {
                         }) => {
                             debug!("AF msg from 0x{src_addr:04X} ep={src_ep} cluster=0x{cluster_id:04X} lqi={link_quality}");
 
-                            // Unknown NWK? Trigger discovery so we learn about it.
+                            // Unknown NWK? Request IEEE address to link it.
                             if devices.get_by_nwk(src_addr).is_none() {
-                                debug!("Unknown NWK 0x{src_addr:04X}, requesting discovery");
-                                coord.request_active_eps(src_addr).await.ok();
+                                debug!("Unknown NWK 0x{src_addr:04X}, requesting IEEE address");
+                                coord.request_ieee_addr(src_addr).await.ok();
                             }
 
                             if cluster_id == 0x0000 {

@@ -269,6 +269,26 @@ async fn event_pump(mut znp_rx: mpsc::Receiver<ZnpEvent>, out: mpsc::Sender<Coor
                     output_clusters: r.output_clusters,
                 })
             }
+            ZnpEvent::IeeeAddrRsp(data) => {
+                IeeeAddrRsp::parse(&data).map(|r| CoordinatorEvent::AddressResolved {
+                    ieee_addr: r.ieee_addr,
+                    nwk_addr: r.nwk_addr,
+                })
+            }
+            ZnpEvent::TcDevInd(data) => {
+                // TC_DEV_IND: SrcAddr(u16) + IEEEAddr(8) + ParentAddr(u16)
+                if data.len() >= 10 {
+                    let nwk_addr = u16::from_le_bytes([data[0], data[1]]);
+                    let mut ieee = [0u8; 8];
+                    ieee.copy_from_slice(&data[2..10]);
+                    Some(CoordinatorEvent::AddressResolved {
+                        ieee_addr: ieee,
+                        nwk_addr,
+                    })
+                } else {
+                    None
+                }
+            }
             _ => None,
         };
 
@@ -308,6 +328,13 @@ impl ZnpHandle {
     pub async fn request_simple_desc(&self, nwk_addr: u16, endpoint: u8) -> Result<()> {
         self.transport
             .request(zdo_simple_desc_req(nwk_addr, nwk_addr, endpoint))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn request_ieee_addr(&self, nwk_addr: u16) -> Result<()> {
+        self.transport
+            .request(zdo_ieee_addr_req(nwk_addr))
             .await?;
         Ok(())
     }

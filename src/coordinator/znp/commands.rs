@@ -197,10 +197,11 @@ impl AfIncomingMsg {
 // ─── ZDO subsystem ────────────────────────────────────────────────────────────
 
 mod zdo {
-    pub const STARTUP_FROM_APP: u8 = 0x40;
-    pub const PERMIT_JOIN_REQ: u8 = 0x36;
-    pub const ACTIVE_EP_REQ: u8 = 0x05;
+    pub const IEEE_ADDR_REQ: u8 = 0x01;
     pub const SIMPLE_DESC_REQ: u8 = 0x04;
+    pub const ACTIVE_EP_REQ: u8 = 0x05;
+    pub const PERMIT_JOIN_REQ: u8 = 0x36;
+    pub const STARTUP_FROM_APP: u8 = 0x40;
 }
 
 pub fn zdo_startup_from_app(start_delay_ms: u16) -> ZnpFrame {
@@ -233,6 +234,38 @@ pub fn zdo_simple_desc_req(dst_addr: u16, nwk_addr_of_interest: u16, endpoint: u
     data.extend_from_slice(&nwk_addr_of_interest.to_le_bytes());
     data.push(endpoint);
     ZnpFrame::sreq(Subsystem::Zdo, zdo::SIMPLE_DESC_REQ, data)
+}
+
+/// Request IEEE address for a given NWK address.
+pub fn zdo_ieee_addr_req(nwk_addr: u16) -> ZnpFrame {
+    let mut data = Vec::new();
+    data.extend_from_slice(&nwk_addr.to_le_bytes());
+    data.push(0x00); // ReqType: single device response
+    data.push(0x00); // StartIndex
+    ZnpFrame::sreq(Subsystem::Zdo, zdo::IEEE_ADDR_REQ, data)
+}
+
+/// ZDO_IEEE_ADDR_RSP (AREQ cmd1=0x81)
+#[derive(Debug, Clone)]
+pub struct IeeeAddrRsp {
+    pub ieee_addr: [u8; 8],
+    pub nwk_addr: u16,
+}
+
+impl IeeeAddrRsp {
+    pub fn parse(data: &[u8]) -> Option<Self> {
+        if data.len() < 11 {
+            return None;
+        }
+        let status = data[0];
+        if status != 0 {
+            return None;
+        }
+        let mut ieee = [0u8; 8];
+        ieee.copy_from_slice(&data[1..9]);
+        let nwk_addr = u16::from_le_bytes([data[9], data[10]]);
+        Some(Self { ieee_addr: ieee, nwk_addr })
+    }
 }
 
 #[derive(Debug, Clone)]

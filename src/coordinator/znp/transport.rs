@@ -31,6 +31,8 @@ pub enum ZnpEvent {
     AfIncomingMsg(Vec<u8>),
     ActiveEpRsp(Vec<u8>),
     SimpleDescRsp(Vec<u8>),
+    IeeeAddrRsp(Vec<u8>),
+    TcDevInd(Vec<u8>),
     StateChangeInd,
     Other,
 }
@@ -131,12 +133,14 @@ impl TransportActor {
         // AREQ – convert to typed event and fan-out
         let event = match (frame.subsystem, frame.cmd1) {
             (Subsystem::Sys, 0x80) => ZnpEvent::ResetInd,
+            (Subsystem::Zdo, 0x81) => ZnpEvent::IeeeAddrRsp(frame.data),
+            (Subsystem::Zdo, 0x84) => ZnpEvent::SimpleDescRsp(frame.data),
+            (Subsystem::Zdo, 0x85) => ZnpEvent::ActiveEpRsp(frame.data),
+            (Subsystem::Zdo, 0xC0) => ZnpEvent::StateChangeInd,
             (Subsystem::Zdo, 0xC1) => ZnpEvent::EndDeviceAnnceInd(frame.data),
             (Subsystem::Zdo, 0xC9) => ZnpEvent::LeaveInd(frame.data),
+            (Subsystem::Zdo, 0xCA) => ZnpEvent::TcDevInd(frame.data),
             (Subsystem::Af, 0x81) => ZnpEvent::AfIncomingMsg(frame.data),
-            (Subsystem::Zdo, 0x85) => ZnpEvent::ActiveEpRsp(frame.data),
-            (Subsystem::Zdo, 0x84) => ZnpEvent::SimpleDescRsp(frame.data),
-            (Subsystem::Zdo, 0xC0) => ZnpEvent::StateChangeInd,
             _ => ZnpEvent::Other,
         };
 

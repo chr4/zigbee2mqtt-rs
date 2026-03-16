@@ -7,8 +7,6 @@ use crate::config::{AdapterType, Config};
 use crate::error::Result;
 use znp::{ZnpCoordinator, ZnpHandle};
 
-// ── Coordinator-level events (adapter-agnostic) ───────────────────────────────
-
 #[derive(Debug, Clone)]
 pub enum CoordinatorEvent {
     DeviceJoined {
@@ -17,6 +15,11 @@ pub enum CoordinatorEvent {
     },
     DeviceLeft {
         ieee_addr: [u8; 8],
+    },
+    /// IEEE↔NWK address resolved (from ZDO_IEEE_ADDR_RSP or TC_DEV_IND).
+    AddressResolved {
+        ieee_addr: [u8; 8],
+        nwk_addr: u16,
     },
     Message {
         src_addr: u16,
@@ -39,16 +42,12 @@ pub enum CoordinatorEvent {
     },
 }
 
-// ── Coordinator info (for bridge/info topic) ─────────────────────────────────
-
 #[derive(Debug, Clone)]
 pub struct CoordinatorInfo {
     pub ieee_addr: Option<[u8; 8]>,
     pub version: String,
     pub transport_rev: u8,
 }
-
-// ── CoordinatorHandle – what the bridge holds ─────────────────────────────────
 
 pub struct CoordinatorHandle {
     pub inner: Arc<Mutex<ZnpHandle>>,
@@ -87,9 +86,15 @@ impl CoordinatorHandle {
             .request_simple_desc(nwk_addr, endpoint)
             .await
     }
-}
 
-// ── Factory ───────────────────────────────────────────────────────────────────
+    pub async fn request_ieee_addr(&self, nwk_addr: u16) -> Result<()> {
+        self.inner
+            .lock()
+            .await
+            .request_ieee_addr(nwk_addr)
+            .await
+    }
+}
 
 pub async fn open_coordinator(cfg: &Config) -> Result<CoordinatorHandle> {
     match cfg.serial.adapter {
