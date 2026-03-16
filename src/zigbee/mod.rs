@@ -15,9 +15,6 @@ impl IeeeAddr {
         )
     }
 
-    pub fn is_zero(&self) -> bool {
-        self.0.iter().all(|&b| b == 0)
-    }
 }
 
 impl std::fmt::Display for IeeeAddr {

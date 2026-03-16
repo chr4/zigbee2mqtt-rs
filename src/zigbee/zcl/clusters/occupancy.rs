@@ -12,8 +12,6 @@ const OCCUPANCY:             u16 = 0x0000;
 const OCCUPANCY_SENSOR_TYPE: u16 = 0x0001;
 
 impl ClusterHandler for OccupancyCluster {
-    fn cluster_id(&self) -> u16 { 0x0406 }
-
     fn process_reports(&self, reports: &[AttributeReport]) -> Vec<(String, Value)> {
         let mut out = Vec::new();
         for r in reports {

@@ -11,8 +11,6 @@ pub struct LevelCluster;
 const CURRENT_LEVEL: u16 = 0x0000;
 
 impl ClusterHandler for LevelCluster {
-    fn cluster_id(&self) -> u16 { 0x0008 }
-
     fn process_reports(&self, reports: &[AttributeReport]) -> Vec<(String, Value)> {
         let mut out = Vec::new();
         for r in reports {

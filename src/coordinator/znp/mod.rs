@@ -74,7 +74,7 @@ impl ZnpCoordinator {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             match tokio::time::timeout_at(deadline, self.event_rx.recv()).await {
-                Ok(Some(ZnpEvent::ResetInd(_))) => {
+                Ok(Some(ZnpEvent::ResetInd)) => {
                     info!("Received SYS_RESET_IND");
                     return Ok(());
                 }
@@ -239,7 +239,6 @@ async fn event_pump(mut znp_rx: mpsc::Receiver<ZnpEvent>, out: mpsc::Sender<Coor
             ZnpEvent::LeaveInd(data) => {
                 LeaveInd::parse(&data).map(|d| CoordinatorEvent::DeviceLeft {
                     ieee_addr: d.ieee_addr,
-                    nwk_addr: d.src_addr,
                 })
             }
             ZnpEvent::AfIncomingMsg(data) => {

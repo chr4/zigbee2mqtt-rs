@@ -13,11 +13,7 @@ use crate::error::Result;
 /// Decoded result from a ZCL message.
 #[derive(Debug, Clone)]
 pub struct ZclMessage {
-    pub cluster_id: u16,
-    /// Flattened key/value pairs ready for MQTT publishing
-    pub values:     Map<String, Value>,
-    /// True if this message should trigger a "set" rather than "state" publish
-    pub is_command: bool,
+    pub values: Map<String, Value>,
 }
 
 /// Parse a raw ZCL payload (bytes from AF_INCOMING_MSG) and produce a `ZclMessage`.
@@ -61,11 +57,7 @@ pub fn parse_message(cluster_id: u16, raw: &[u8]) -> Result<Option<ZclMessage>> 
         values.insert(k, v);
     }
 
-    Ok(Some(ZclMessage {
-        cluster_id,
-        values,
-        is_command: header.frame_type == FrameType::ClusterSpecific,
-    }))
+    Ok(Some(ZclMessage { values }))
 }
 
 /// Parse a Read Attributes Response payload into AttributeReports.

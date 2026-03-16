@@ -17,7 +17,6 @@ pub enum CoordinatorEvent {
     },
     DeviceLeft {
         ieee_addr: [u8; 8],
-        nwk_addr: u16,
     },
     Message {
         src_addr: u16,

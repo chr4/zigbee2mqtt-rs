@@ -6,18 +6,14 @@ use crate::coordinator::znp::frame::{Subsystem, ZnpFrame};
 
 // ─── SYS subsystem ────────────────────────────────────────────────────────────
 
-pub mod sys {
-    pub const RESET_REQ: u8 = 0x00; // AREQ (host → device)
-    pub const VERSION: u8 = 0x02; // SREQ/SRSP
-    pub const OSAL_NV_READ: u8 = 0x08;
+mod sys {
+    pub const RESET_REQ: u8 = 0x00;
+    pub const VERSION: u8 = 0x02;
     pub const OSAL_NV_WRITE: u8 = 0x09;
-    pub const OSAL_NV_INIT: u8 = 0x07;
 }
 
-/// Reset type for SYS_RESET_REQ
 #[derive(Debug, Clone, Copy)]
 pub enum ResetType {
-    Hard = 0,
     Soft = 1,
 }
 
@@ -55,9 +51,7 @@ impl SysVersionRsp {
 
 // ─── NV RAM helpers ──────────────────────────────────────────────────────────
 
-/// Well-known Z-Stack NV item IDs.
 pub mod nv {
-    pub const STARTUP_OPTION: u16 = 0x0003;
     pub const LOGICAL_TYPE: u16 = 0x0087;
     pub const PANID: u16 = 0x0083;
     pub const CHANLIST: u16 = 0x0084;
@@ -76,41 +70,23 @@ pub fn sys_osal_nv_write(item_id: u16, data: &[u8]) -> ZnpFrame {
     ZnpFrame::sreq(Subsystem::Sys, sys::OSAL_NV_WRITE, payload)
 }
 
-pub fn sys_osal_nv_read(item_id: u16, offset: u8) -> ZnpFrame {
-    let mut payload = Vec::with_capacity(3);
-    payload.extend_from_slice(&item_id.to_le_bytes());
-    payload.push(offset);
-    ZnpFrame::sreq(Subsystem::Sys, sys::OSAL_NV_READ, payload)
-}
-
 // ─── APP_CNF subsystem ────────────────────────────────────────────────────────
 
-pub mod app_cnf {
-    pub const BDB_START_COMMISSIONING: u8 = 0x05;
+mod app_cnf {
     pub const BDB_SET_CHANNEL: u8 = 0x08;
 }
 
-/// Set the BDB channel mask. `is_primary` selects primary (true) or secondary.
 pub fn app_cnf_bdb_set_channel(channel_mask: u32, is_primary: bool) -> ZnpFrame {
     let mut data = Vec::with_capacity(5);
-    data.push(if is_primary { 1 } else { 0 });
+    data.push(u8::from(is_primary));
     data.extend_from_slice(&channel_mask.to_le_bytes());
     ZnpFrame::sreq(Subsystem::AppCnf, app_cnf::BDB_SET_CHANNEL, data)
 }
 
-pub fn app_cnf_bdb_start_commissioning(mode: u8) -> ZnpFrame {
-    ZnpFrame::sreq(
-        Subsystem::AppCnf,
-        app_cnf::BDB_START_COMMISSIONING,
-        vec![mode],
-    )
-}
-
 // ─── UTIL subsystem ───────────────────────────────────────────────────────────
 
-pub mod util {
+mod util {
     pub const GET_DEVICE_INFO: u8 = 0x00;
-    pub const CALLBACK_SUB_CMD: u8 = 0x06;
 }
 
 pub fn util_get_device_info() -> ZnpFrame {
@@ -120,43 +96,22 @@ pub fn util_get_device_info() -> ZnpFrame {
 #[derive(Debug, Clone)]
 pub struct DeviceInfo {
     pub ieee_addr: [u8; 8],
-    pub short_addr: u16,
-    pub device_type: u8,
-    pub device_state: u8,
-    pub assoc_devices: Vec<u16>,
 }
 
 impl DeviceInfo {
     pub fn parse(data: &[u8]) -> Option<Self> {
-        if data.len() < 12 {
+        if data.len() < 8 {
             return None;
         }
         let mut ieee = [0u8; 8];
         ieee.copy_from_slice(&data[0..8]);
-        let short_addr = u16::from_le_bytes([data[8], data[9]]);
-        let device_type = data[10];
-        let device_state = data[11];
-        let n_assoc = if data.len() > 12 { data[12] as usize } else { 0 };
-        let mut assoc = Vec::with_capacity(n_assoc);
-        for i in 0..n_assoc {
-            let base = 13 + i * 2;
-            if base + 1 < data.len() {
-                assoc.push(u16::from_le_bytes([data[base], data[base + 1]]));
-            }
-        }
-        Some(Self {
-            ieee_addr: ieee,
-            short_addr,
-            device_type,
-            device_state,
-            assoc_devices: assoc,
-        })
+        Some(Self { ieee_addr: ieee })
     }
 }
 
 // ─── AF subsystem ─────────────────────────────────────────────────────────────
 
-pub mod af {
+mod af {
     pub const REGISTER: u8 = 0x00;
     pub const DATA_REQUEST: u8 = 0x01;
 }
@@ -173,7 +128,7 @@ pub fn af_register(
     data.extend_from_slice(&profile_id.to_le_bytes());
     data.extend_from_slice(&device_id.to_le_bytes());
     data.push(0); // device version
-    data.push(0); // latency (no latency)
+    data.push(0); // latency
     data.push(input_clusters.len() as u8);
     for &c in input_clusters {
         data.extend_from_slice(&c.to_le_bytes());
@@ -208,11 +163,9 @@ pub fn af_data_request(
 
 #[derive(Debug, Clone)]
 pub struct AfIncomingMsg {
-    pub group_id: u16,
     pub cluster_id: u16,
     pub src_addr: u16,
     pub src_ep: u8,
-    pub dst_ep: u8,
     pub link_quality: u8,
     pub data: Vec<u8>,
 }
@@ -222,25 +175,19 @@ impl AfIncomingMsg {
         if raw.len() < 17 {
             return None;
         }
-        let group_id = u16::from_le_bytes([raw[0], raw[1]]);
         let cluster_id = u16::from_le_bytes([raw[2], raw[3]]);
         let src_addr = u16::from_le_bytes([raw[4], raw[5]]);
         let src_ep = raw[6];
-        let dst_ep = raw[7];
-        // raw[8] = was_broadcast, raw[9] = link_quality, raw[10] = security
         let link_quality = raw[9];
-        // raw[11..15] = timestamp, raw[15] = trans_seq_num
         let len = raw[16] as usize;
         if raw.len() < 17 + len {
             return None;
         }
         let data = raw[17..17 + len].to_vec();
         Some(Self {
-            group_id,
             cluster_id,
             src_addr,
             src_ep,
-            dst_ep,
             link_quality,
             data,
         })
@@ -249,12 +196,11 @@ impl AfIncomingMsg {
 
 // ─── ZDO subsystem ────────────────────────────────────────────────────────────
 
-pub mod zdo {
+mod zdo {
     pub const STARTUP_FROM_APP: u8 = 0x40;
     pub const PERMIT_JOIN_REQ: u8 = 0x36;
     pub const ACTIVE_EP_REQ: u8 = 0x05;
     pub const SIMPLE_DESC_REQ: u8 = 0x04;
-    pub const MSG_CB_REGISTER: u8 = 0x3E;
 }
 
 pub fn zdo_startup_from_app(start_delay_ms: u16) -> ZnpFrame {
@@ -289,21 +235,10 @@ pub fn zdo_simple_desc_req(dst_addr: u16, nwk_addr_of_interest: u16, endpoint: u
     ZnpFrame::sreq(Subsystem::Zdo, zdo::SIMPLE_DESC_REQ, data)
 }
 
-/// Register for a ZDO callback by cluster ID.
-pub fn zdo_msg_cb_register(cluster_id: u16) -> ZnpFrame {
-    ZnpFrame::sreq(
-        Subsystem::Zdo,
-        zdo::MSG_CB_REGISTER,
-        cluster_id.to_le_bytes().to_vec(),
-    )
-}
-
 #[derive(Debug, Clone)]
 pub struct EndDeviceAnnceInd {
-    pub src_addr: u16,
     pub nwk_addr: u16,
     pub ieee_addr: [u8; 8],
-    pub capabilities: u8,
 }
 
 impl EndDeviceAnnceInd {
@@ -311,23 +246,18 @@ impl EndDeviceAnnceInd {
         if data.len() < 12 {
             return None;
         }
-        let src_addr = u16::from_le_bytes([data[0], data[1]]);
         let nwk_addr = u16::from_le_bytes([data[2], data[3]]);
         let mut ieee = [0u8; 8];
         ieee.copy_from_slice(&data[4..12]);
-        let capabilities = if data.len() > 12 { data[12] } else { 0 };
         Some(Self {
-            src_addr,
             nwk_addr,
             ieee_addr: ieee,
-            capabilities,
         })
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct LeaveInd {
-    pub src_addr: u16,
     pub ieee_addr: [u8; 8],
 }
 
@@ -336,20 +266,15 @@ impl LeaveInd {
         if data.len() < 10 {
             return None;
         }
-        let src_addr = u16::from_le_bytes([data[0], data[1]]);
         let mut ieee = [0u8; 8];
         ieee.copy_from_slice(&data[2..10]);
-        Some(Self {
-            src_addr,
-            ieee_addr: ieee,
-        })
+        Some(Self { ieee_addr: ieee })
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct ActiveEpRsp {
     pub nwk_addr: u16,
-    pub status: u8,
     pub endpoints: Vec<u8>,
 }
 
@@ -358,7 +283,6 @@ impl ActiveEpRsp {
         if data.len() < 6 {
             return None;
         }
-        let status = data[2];
         let nwk_addr = u16::from_le_bytes([data[3], data[4]]);
         let count = data[5] as usize;
         if data.len() < 6 + count {
@@ -367,7 +291,6 @@ impl ActiveEpRsp {
         let endpoints = data[6..6 + count].to_vec();
         Some(Self {
             nwk_addr,
-            status,
             endpoints,
         })
     }
@@ -376,7 +299,6 @@ impl ActiveEpRsp {
 #[derive(Debug, Clone)]
 pub struct SimpleDescRsp {
     pub nwk_addr: u16,
-    pub status: u8,
     pub endpoint: u8,
     pub profile_id: u16,
     pub device_id: u16,
@@ -389,13 +311,10 @@ impl SimpleDescRsp {
         if data.len() < 12 {
             return None;
         }
-        let status = data[2];
         let nwk_addr = u16::from_le_bytes([data[3], data[4]]);
-        // data[5] = descriptor len
         let endpoint = data[6];
         let profile_id = u16::from_le_bytes([data[7], data[8]]);
         let device_id = u16::from_le_bytes([data[9], data[10]]);
-        // data[11] high nibble = device version
         let mut pos = 12;
         let n_in = *data.get(pos)? as usize;
         pos += 1;
@@ -419,7 +338,6 @@ impl SimpleDescRsp {
         }
         Some(Self {
             nwk_addr,
-            status,
             endpoint,
             profile_id,
             device_id,
@@ -439,16 +357,10 @@ mod tests {
     #[test]
     fn sys_reset_req_uses_correct_cmd1() {
         let frame = sys_reset_req(ResetType::Soft);
-        assert_eq!(frame.cmd1, 0x00, "SYS_RESET_REQ cmd1 must be 0x00");
+        assert_eq!(frame.cmd1, 0x00);
         assert_eq!(frame.subsystem, Subsystem::Sys);
         assert_eq!(frame.frame_type, FrameType::AReq);
-        assert_eq!(frame.data, vec![0x01]); // Soft reset
-    }
-
-    #[test]
-    fn sys_reset_req_hard() {
-        let frame = sys_reset_req(ResetType::Hard);
-        assert_eq!(frame.data, vec![0x00]);
+        assert_eq!(frame.data, vec![0x01]);
     }
 
     #[test]
@@ -461,18 +373,18 @@ mod tests {
     #[test]
     fn nv_write_format() {
         let frame = sys_osal_nv_write(nv::PANID, &0x1A62u16.to_le_bytes());
-        assert_eq!(frame.cmd1, 0x09); // SYS_OSAL_NV_WRITE
-        assert_eq!(frame.data[0..2], 0x0083u16.to_le_bytes()); // item ID
+        assert_eq!(frame.cmd1, 0x09);
+        assert_eq!(frame.data[0..2], 0x0083u16.to_le_bytes());
         assert_eq!(frame.data[2], 0); // offset
         assert_eq!(frame.data[3], 2); // length
-        assert_eq!(frame.data[4..6], 0x1A62u16.to_le_bytes()); // value
+        assert_eq!(frame.data[4..6], 0x1A62u16.to_le_bytes());
     }
 
     #[test]
     fn bdb_set_channel_primary() {
         let frame = app_cnf_bdb_set_channel(1 << 11, true);
-        assert_eq!(frame.data[0], 1, "isPrimary should be 1 for primary channel");
-        assert_eq!(frame.data.len(), 5, "should be 1 byte isPrimary + 4 bytes mask");
+        assert_eq!(frame.data[0], 1);
+        assert_eq!(frame.data.len(), 5);
         let mask = u32::from_le_bytes([frame.data[1], frame.data[2], frame.data[3], frame.data[4]]);
         assert_eq!(mask, 1 << 11);
     }
@@ -480,15 +392,15 @@ mod tests {
     #[test]
     fn bdb_set_channel_secondary() {
         let frame = app_cnf_bdb_set_channel(0, false);
-        assert_eq!(frame.data[0], 0, "isPrimary should be 0 for secondary");
+        assert_eq!(frame.data[0], 0);
     }
 
     #[test]
     fn af_register_format() {
         let frame = af_register(1, 0x0104, 0x0005, &[0x0000, 0x0006], &[0x0006]);
         assert_eq!(frame.cmd1, 0x00);
-        assert_eq!(frame.data[0], 1); // endpoint
-        assert_eq!(u16::from_le_bytes([frame.data[1], frame.data[2]]), 0x0104); // profile
+        assert_eq!(frame.data[0], 1);
+        assert_eq!(u16::from_le_bytes([frame.data[1], frame.data[2]]), 0x0104);
         assert_eq!(frame.data[7], 2); // 2 input clusters
         assert_eq!(frame.data[12], 1); // 1 output cluster
     }
@@ -500,7 +412,7 @@ mod tests {
         assert_eq!(u16::from_le_bytes([frame.data[0], frame.data[1]]), 0x1234);
         assert_eq!(frame.data[2], 1); // dst_ep
         assert_eq!(frame.data[3], 1); // src_ep
-        assert_eq!(u16::from_le_bytes([frame.data[4], frame.data[5]]), 0x0006); // cluster_id
+        assert_eq!(u16::from_le_bytes([frame.data[4], frame.data[5]]), 0x0006);
         assert_eq!(frame.data[6], 5); // trans_id
         assert_eq!(frame.data[7], 0x30); // options
         assert_eq!(frame.data[8], 0xFF); // radius
@@ -511,17 +423,14 @@ mod tests {
     #[test]
     fn parse_af_incoming_msg() {
         let mut raw = vec![0; 17];
-        // cluster_id at [2..4]
         raw[2] = 0x06;
         raw[3] = 0x00; // cluster 0x0006
-        // src_addr at [4..6]
         raw[4] = 0x34;
         raw[5] = 0x12; // 0x1234
         raw[6] = 1; // src_ep
-        raw[7] = 1; // dst_ep
         raw[9] = 120; // link_quality
         raw[16] = 3; // data len
-        raw.extend_from_slice(&[0x11, 0x01, 0x01]); // data
+        raw.extend_from_slice(&[0x11, 0x01, 0x01]);
         let msg = AfIncomingMsg::parse(&raw).unwrap();
         assert_eq!(msg.cluster_id, 0x0006);
         assert_eq!(msg.src_addr, 0x1234);
@@ -538,10 +447,11 @@ mod tests {
             0x8E, // capabilities
         ];
         let ind = EndDeviceAnnceInd::parse(&data).unwrap();
-        assert_eq!(ind.src_addr, 0x1234);
         assert_eq!(ind.nwk_addr, 0x7856);
-        assert_eq!(ind.ieee_addr, [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
-        assert_eq!(ind.capabilities, 0x8E);
+        assert_eq!(
+            ind.ieee_addr,
+            [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]
+        );
     }
 
     #[test]
@@ -588,9 +498,9 @@ mod tests {
     #[test]
     fn permit_join_format() {
         let frame = zdo_permit_join(0xFFFC, 254);
-        assert_eq!(frame.data[0], 0x02); // addr mode
+        assert_eq!(frame.data[0], 0x02);
         assert_eq!(u16::from_le_bytes([frame.data[1], frame.data[2]]), 0xFFFC);
-        assert_eq!(frame.data[3], 254); // duration
+        assert_eq!(frame.data[3], 254);
     }
 
     #[test]
@@ -598,10 +508,8 @@ mod tests {
         let data = vec![20, 1, 2, 7, 1];
         let rsp = SysVersionRsp::parse(&data).unwrap();
         assert_eq!(rsp.transport_rev, 20);
-        assert_eq!(rsp.product_id, 1);
         assert_eq!(rsp.major_rel, 2);
         assert_eq!(rsp.minor_rel, 7);
-        assert_eq!(rsp.hw_rev, 1);
     }
 
     #[test]

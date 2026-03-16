@@ -93,7 +93,7 @@ impl Bridge {
                             coord.request_active_eps(nwk_addr).await.ok();
                         }
 
-                        Some(CoordinatorEvent::DeviceLeft { ieee_addr, nwk_addr }) => {
+                        Some(CoordinatorEvent::DeviceLeft { ieee_addr, .. }) => {
                             let ieee = IeeeAddr(ieee_addr);
                             info!("Device left: {ieee}");
                             devices.remove_by_ieee(&ieee);

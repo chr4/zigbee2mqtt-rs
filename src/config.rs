@@ -127,12 +127,6 @@ impl Config {
         Ok(config)
     }
 
-    pub fn save(&self, path: &Path) -> Result<()> {
-        let content = serde_yaml::to_string(self)?;
-        std::fs::write(path, content).map_err(|e| Error::Io(e))?;
-        Ok(())
-    }
-
     fn validate(&self) -> Result<()> {
         if self.advanced.channel < 11 || self.advanced.channel > 26 {
             return Err(Error::Config(format!(

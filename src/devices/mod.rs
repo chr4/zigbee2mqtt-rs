@@ -66,20 +66,6 @@ impl Device {
         "Router"
     }
 
-    /// Check if any endpoint has a given input cluster.
-    pub fn has_cluster(&self, cluster_id: u16) -> bool {
-        self.endpoints
-            .iter()
-            .any(|ep| ep.input_clusters.contains(&cluster_id))
-    }
-
-    /// Get the first endpoint with a given input cluster.
-    pub fn endpoint_with_cluster(&self, cluster_id: u16) -> Option<&EndpointDesc> {
-        self.endpoints
-            .iter()
-            .find(|ep| ep.input_clusters.contains(&cluster_id))
-    }
-
     /// All unique input clusters across all endpoints.
     pub fn all_input_clusters(&self) -> Vec<u16> {
         let mut clusters: Vec<u16> = self
@@ -204,17 +190,6 @@ impl DeviceRegistry {
         }
     }
 
-    pub fn set_friendly_name(&self, ieee: &IeeeAddr, name: String) -> bool {
-        if let Some(mut dev) = self.by_ieee.get_mut(ieee) {
-            self.by_name.remove(&dev.friendly_name);
-            dev.friendly_name = name.clone();
-            self.by_name.insert(name, *ieee);
-            true
-        } else {
-            false
-        }
-    }
-
     pub fn all_devices(&self) -> Vec<Device> {
         self.by_ieee.iter().map(|r| r.value().clone()).collect()
     }
@@ -260,18 +235,6 @@ mod tests {
     }
 
     #[test]
-    fn set_friendly_name_updates_index() {
-        let reg = DeviceRegistry::new();
-        let dev = Device::new(test_ieee(), 0x1234);
-        let old_name = dev.friendly_name.clone();
-        reg.add(dev);
-
-        reg.set_friendly_name(&test_ieee(), "new_name".to_string());
-        assert!(reg.find_by_name(&old_name).is_none());
-        assert!(reg.find_by_name("new_name").is_some());
-    }
-
-    #[test]
     fn remove_clears_all_indexes() {
         let reg = DeviceRegistry::new();
         let dev = Device::new(test_ieee(), 0x1234);
@@ -309,7 +272,7 @@ mod tests {
     }
 
     #[test]
-    fn device_has_cluster() {
+    fn all_input_clusters_deduped() {
         let mut dev = Device::new(test_ieee(), 0x1234);
         dev.endpoints.push(EndpointDesc {
             endpoint: 1,
@@ -319,8 +282,9 @@ mod tests {
             output_clusters: vec![],
         });
 
-        assert!(dev.has_cluster(0x0006));
-        assert!(dev.has_cluster(0x0008));
-        assert!(!dev.has_cluster(0x0300));
+        let clusters = dev.all_input_clusters();
+        assert!(clusters.contains(&0x0006));
+        assert!(clusters.contains(&0x0008));
+        assert!(!clusters.contains(&0x0300));
     }
 }

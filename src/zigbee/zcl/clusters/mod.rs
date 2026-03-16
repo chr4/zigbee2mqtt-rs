@@ -1,31 +1,25 @@
 pub mod basic;
-pub mod power;
-pub mod on_off;
-pub mod level;
 pub mod color;
-pub mod illuminance;
-pub mod temperature;
 pub mod humidity;
-pub mod occupancy;
 pub mod ias_zone;
+pub mod illuminance;
+pub mod level;
+pub mod occupancy;
+pub mod on_off;
+pub mod power;
+pub mod temperature;
 
 use serde_json::Value;
 
 use super::attribute::AttributeReport;
 
 /// Trait implemented by every cluster handler.
-/// `process` takes parsed attribute reports and produces a JSON object
-/// (or cluster-specific command payloads) suitable for MQTT publishing.
 pub trait ClusterHandler: Send + Sync {
-    /// Returns the ZCL cluster ID this handler covers.
-    fn cluster_id(&self) -> u16;
-
     /// Process incoming attribute reports, returning key/value pairs
     /// to merge into the device state JSON.
     fn process_reports(&self, reports: &[AttributeReport]) -> Vec<(String, Value)>;
 
     /// Process a cluster-specific command (frame_type = 1).
-    /// Returns key/value pairs just like `process_reports`.
     fn process_command(&self, _command_id: u8, _payload: &[u8]) -> Vec<(String, Value)> {
         vec![]
     }
@@ -44,6 +38,6 @@ pub fn handler_for(cluster_id: u16) -> Option<Box<dyn ClusterHandler>> {
         0x0405 => Some(Box::new(humidity::HumidityCluster)),
         0x0406 => Some(Box::new(occupancy::OccupancyCluster)),
         0x0500 => Some(Box::new(ias_zone::IasZoneCluster)),
-        _      => None,
+        _ => None,
     }
 }

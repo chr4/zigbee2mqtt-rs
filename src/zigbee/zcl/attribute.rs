@@ -92,7 +92,7 @@ pub enum AttributeValue {
     I32(i32),
     Float(f32),
     Str(String),
-    Bytes(Vec<u8>),
+    Bytes,
     Invalid,
 }
 
@@ -149,13 +149,13 @@ impl AttributeValue {
                 if buf.is_empty() { return Err(Error::Zcl("missing octet-string length".into())); }
                 let len = buf[0] as usize;
                 if buf.len() < 1 + len { return Err(Error::Zcl("truncated octet string".into())); }
-                Ok((Self::Bytes(buf[1..1 + len].to_vec()), 1 + len))
+                Ok((Self::Bytes, 1 + len))
             }
             DataType::NoData => Ok((Self::Invalid, 0)),
             _ => {
                 // Unknown type — skip based on fixed length if available
                 if let Some(len) = data_type.fixed_len() {
-                    Ok((Self::Bytes(buf[..len.min(buf.len())].to_vec()), len.min(buf.len())))
+                    Ok((Self::Bytes, len.min(buf.len())))
                 } else {
                     Err(Error::Zcl(format!("unsupported attribute type {:?}", data_type)))
                 }

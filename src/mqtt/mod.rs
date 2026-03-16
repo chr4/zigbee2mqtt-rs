@@ -21,7 +21,6 @@ pub enum MqttCommand {
     },
     GetDevice {
         friendly_name: String,
-        payload: serde_json::Value,
     },
 }
 
@@ -207,7 +206,6 @@ async fn run_event_loop(
                     } else {
                         MqttCommand::GetDevice {
                             friendly_name: name,
-                            payload: json_value,
                         }
                     };
                     let _ = cmd_tx.send(cmd).await;

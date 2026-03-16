@@ -354,17 +354,17 @@ mod tests {
 
     #[test]
     fn light_has_correct_clusters() {
-        let dev = make_light();
-        assert!(dev.has_cluster(0x0006)); // on_off
-        assert!(dev.has_cluster(0x0008)); // level
-        assert!(dev.has_cluster(0x0300)); // color
+        let clusters = make_light().all_input_clusters();
+        assert!(clusters.contains(&0x0006));
+        assert!(clusters.contains(&0x0008));
+        assert!(clusters.contains(&0x0300));
     }
 
     #[test]
     fn sensor_has_battery_and_temp() {
-        let dev = make_sensor();
-        assert!(dev.has_cluster(0x0001)); // power
-        assert!(dev.has_cluster(0x0402)); // temperature
-        assert!(dev.has_cluster(0x0405)); // humidity
+        let clusters = make_sensor().all_input_clusters();
+        assert!(clusters.contains(&0x0001));
+        assert!(clusters.contains(&0x0402));
+        assert!(clusters.contains(&0x0405));
     }
 }

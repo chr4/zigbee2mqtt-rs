@@ -16,8 +16,6 @@ const POWER_SOURCE:      u16 = 0x0007;
 const SW_BUILD_ID:       u16 = 0x4000;
 
 impl ClusterHandler for BasicCluster {
-    fn cluster_id(&self) -> u16 { 0x0000 }
-
     fn process_reports(&self, reports: &[AttributeReport]) -> Vec<(String, Value)> {
         let mut out = Vec::new();
         for r in reports {

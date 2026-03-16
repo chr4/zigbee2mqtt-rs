@@ -13,7 +13,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_serial::SerialPortBuilderExt;
 use tokio_stream::StreamExt;
 use tokio_util::codec::Framed;
-use tracing::{debug, error, trace, warn};
+use tracing::{error, trace, warn};
 
 use super::frame::{FrameType, Subsystem, ZnpCodec, ZnpFrame};
 use crate::error::{Error, Result};
@@ -25,14 +25,14 @@ const CHANNEL_CAPACITY: usize  = 64;
 
 #[derive(Debug, Clone)]
 pub enum ZnpEvent {
-    ResetInd(Vec<u8>),
+    ResetInd,
     EndDeviceAnnceInd(Vec<u8>),
     LeaveInd(Vec<u8>),
     AfIncomingMsg(Vec<u8>),
     ActiveEpRsp(Vec<u8>),
     SimpleDescRsp(Vec<u8>),
-    StateChangeInd(Vec<u8>),
-    Other { subsystem: Subsystem, cmd1: u8, data: Vec<u8> },
+    StateChangeInd,
+    Other,
 }
 
 // Internal message types for the actor task
@@ -117,14 +117,14 @@ impl TransportActor {
 
         // AREQ – convert to typed event and fan-out
         let event = match (frame.subsystem, frame.cmd1) {
-            (Subsystem::Sys, 0x80)  => ZnpEvent::ResetInd(frame.data),
+            (Subsystem::Sys, 0x80) => ZnpEvent::ResetInd,
             (Subsystem::Zdo, 0xC1) => ZnpEvent::EndDeviceAnnceInd(frame.data),
             (Subsystem::Zdo, 0xC9) => ZnpEvent::LeaveInd(frame.data),
-            (Subsystem::Af,  0x81) => ZnpEvent::AfIncomingMsg(frame.data),
+            (Subsystem::Af, 0x81) => ZnpEvent::AfIncomingMsg(frame.data),
             (Subsystem::Zdo, 0x85) => ZnpEvent::ActiveEpRsp(frame.data),
             (Subsystem::Zdo, 0x84) => ZnpEvent::SimpleDescRsp(frame.data),
-            (Subsystem::Zdo, 0xC0) => ZnpEvent::StateChangeInd(frame.data),
-            (sub, cmd1)            => ZnpEvent::Other { subsystem: sub, cmd1, data: frame.data },
+            (Subsystem::Zdo, 0xC0) => ZnpEvent::StateChangeInd,
+            _ => ZnpEvent::Other,
         };
 
         if let Err(e) = self.event_tx.try_send(event) {

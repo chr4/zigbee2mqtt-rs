@@ -12,25 +12,14 @@ pub struct IasZoneCluster;
 // Cluster-specific commands (server → client):
 //   0x00 – Zone Status Change Notification
 
-const ZONE_STATE:  u16 = 0x0000;
-const ZONE_TYPE:   u16 = 0x0001;
 const ZONE_STATUS: u16 = 0x0002;
 
-// ZoneStatus bit masks
-const ALARM1:    u16 = 0x0001;
-const ALARM2:    u16 = 0x0002;
-const TAMPER:    u16 = 0x0004;
-const BATTERY:   u16 = 0x0008;
-const SUPV_REP:  u16 = 0x0010;
-const RESTORE:   u16 = 0x0020;
-const TROUBLE:   u16 = 0x0040;
-const AC_MAINS:  u16 = 0x0080;
-const TEST:      u16 = 0x0100;
-const BATTDEF:   u16 = 0x0200;
+const ALARM1: u16 = 0x0001;
+const TAMPER: u16 = 0x0004;
+const BATTERY: u16 = 0x0008;
+const TROUBLE: u16 = 0x0040;
 
 impl ClusterHandler for IasZoneCluster {
-    fn cluster_id(&self) -> u16 { 0x0500 }
-
     fn process_reports(&self, reports: &[AttributeReport]) -> Vec<(String, Value)> {
         let mut out = Vec::new();
         for r in reports {

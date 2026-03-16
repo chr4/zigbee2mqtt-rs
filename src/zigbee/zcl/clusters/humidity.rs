@@ -10,8 +10,6 @@ pub struct HumidityCluster;
 const MEASURED_VALUE: u16 = 0x0000;
 
 impl ClusterHandler for HumidityCluster {
-    fn cluster_id(&self) -> u16 { 0x0405 }
-
     fn process_reports(&self, reports: &[AttributeReport]) -> Vec<(String, Value)> {
         let mut out = Vec::new();
         for r in reports {

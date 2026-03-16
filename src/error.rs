@@ -29,23 +29,11 @@ pub enum Error {
     #[error("Coordinator timeout waiting for response")]
     Timeout,
 
-    #[error("Coordinator not initialized")]
-    NotInitialized,
-
     #[error("Channel closed")]
     ChannelClosed,
 
     #[error("Configuration error: {0}")]
     Config(String),
-
-    #[error("Frame too short: expected {expected}, got {got}")]
-    FrameTooShort { expected: usize, got: usize },
-
-    #[error("Invalid SOF byte: 0x{0:02X}")]
-    InvalidSof(u8),
-
-    #[error("FCS mismatch: expected 0x{expected:02X}, got 0x{got:02X}")]
-    FcsMismatch { expected: u8, got: u8 },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

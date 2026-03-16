@@ -6,10 +6,7 @@
 use bytes::{Buf, BufMut, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 
-use crate::error::{Error, Result};
-
 pub const SOF: u8 = 0xFE;
-pub const MAX_FRAME_LEN: usize = 256 + 5; // data + overhead
 
 // ── Frame types (bits [7:5] of CMD0) ─────────────────────────────────────────
 
@@ -118,8 +115,8 @@ impl ZnpFrame {
         buf.put_u8(fcs);
     }
 
-    /// Encode to a plain `Vec<u8>`.
-    pub fn to_bytes(&self) -> Vec<u8> {
+    #[cfg(test)]
+    fn to_bytes(&self) -> Vec<u8> {
         let mut buf = BytesMut::with_capacity(5 + self.data.len());
         self.encode_to(&mut buf);
         buf.to_vec()

@@ -13,8 +13,6 @@ const BATTERY_VOLTAGE:    u16 = 0x0020;
 const BATTERY_PERCENTAGE: u16 = 0x0021;
 
 impl ClusterHandler for PowerCluster {
-    fn cluster_id(&self) -> u16 { 0x0001 }
-
     fn process_reports(&self, reports: &[AttributeReport]) -> Vec<(String, Value)> {
         let mut out = Vec::new();
         for r in reports {

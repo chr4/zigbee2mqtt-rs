@@ -13,8 +13,6 @@ pub struct TemperatureCluster;
 const MEASURED_VALUE: u16 = 0x0000;
 
 impl ClusterHandler for TemperatureCluster {
-    fn cluster_id(&self) -> u16 { 0x0402 }
-
     fn process_reports(&self, reports: &[AttributeReport]) -> Vec<(String, Value)> {
         let mut out = Vec::new();
         for r in reports {

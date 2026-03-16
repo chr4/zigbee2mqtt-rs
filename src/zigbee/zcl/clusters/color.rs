@@ -14,10 +14,6 @@ const COLOR_TEMPERATURE: u16 = 0x0007;
 const COLOR_MODE: u16 = 0x0008;
 
 impl ClusterHandler for ColorCluster {
-    fn cluster_id(&self) -> u16 {
-        0x0300
-    }
-
     fn process_reports(&self, reports: &[AttributeReport]) -> Vec<(String, Value)> {
         let mut out = Vec::new();
         // Collect raw values to build nested color object (z2m format)
