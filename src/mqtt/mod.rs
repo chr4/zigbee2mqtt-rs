@@ -4,17 +4,22 @@ use std::time::Duration;
 
 use rumqttc::{AsyncClient, Event, EventLoop, MqttOptions, Packet, QoS};
 use serde_json::json;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 
 use crate::config::MqttConfig;
 use crate::error::{Error, Result};
 
+const MQTT_RECONNECT_DELAY: Duration = Duration::from_secs(1);
+
 // ── Inbound MQTT commands ─────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub enum MqttCommand {
-    PermitJoin { duration: u8 },
+    Connected,
+    PermitJoin {
+        duration: u8,
+    },
     SetDevice {
         friendly_name: String,
         payload: serde_json::Value,
@@ -33,7 +38,7 @@ pub struct MqttBridge {
 
 impl MqttBridge {
     /// Connect to the broker, subscribe to command topics, and spawn the event loop.
-    pub fn connect(cfg: &MqttConfig) -> Result<(Self, mpsc::Receiver<MqttCommand>)> {
+    pub async fn connect(cfg: &MqttConfig) -> Result<(Self, mpsc::Receiver<MqttCommand>)> {
         let mut opts = MqttOptions::new(&cfg.client_id, &cfg.server, cfg.port);
         opts.set_keep_alive(Duration::from_secs(cfg.keepalive as u64));
         opts.set_clean_session(true);
@@ -54,13 +59,18 @@ impl MqttBridge {
 
         let (client, event_loop) = AsyncClient::new(opts, 64);
         let (cmd_tx, cmd_rx) = mpsc::channel::<MqttCommand>(64);
+        let (connected_tx, connected_rx) = oneshot::channel();
 
         let base_topic = cfg.base_topic.clone();
         let client_clone = client.clone();
 
         tokio::spawn(async move {
-            run_event_loop(event_loop, client_clone, &base_topic, cmd_tx).await;
+            run_event_loop(event_loop, client_clone, &base_topic, cmd_tx, connected_tx).await;
         });
+
+        connected_rx.await.map_err(|_| {
+            Error::Config("MQTT event loop exited before initial connection".to_string())
+        })?;
 
         Ok((
             Self {
@@ -153,32 +163,26 @@ async fn run_event_loop(
     client: AsyncClient,
     base_topic: &str,
     cmd_tx: mpsc::Sender<MqttCommand>,
+    connected_tx: oneshot::Sender<()>,
 ) {
-    // Wait for the first ConnAck
+    let mut connected_once = false;
+    let mut connected_tx = Some(connected_tx);
+
     loop {
         match event_loop.poll().await {
-            Ok(Event::Incoming(Packet::ConnAck(_))) => break,
-            Ok(_) => {}
-            Err(e) => {
-                error!("MQTT connect error: {e}");
-                tokio::time::sleep(Duration::from_secs(5)).await;
+            Ok(Event::Incoming(Packet::ConnAck(_))) => {
+                if subscribe_topics(&client, base_topic).await {
+                    if connected_once {
+                        let _ = cmd_tx.send(MqttCommand::Connected).await;
+                    } else {
+                        connected_once = true;
+                        if let Some(tx) = connected_tx.take() {
+                            let _ = tx.send(());
+                        }
+                    }
+                    info!("MQTT connected and subscribed");
+                }
             }
-        }
-    }
-
-    // Subscribe to command topics
-    let set_wildcard = format!("{}/+/set", base_topic);
-    let get_wildcard = format!("{}/+/get", base_topic);
-    let permit_topic = format!("{}/bridge/request/permit_join", base_topic);
-    for topic in &[&set_wildcard, &get_wildcard, &permit_topic] {
-        if let Err(e) = client.subscribe(*topic, QoS::AtLeastOnce).await {
-            error!("MQTT subscribe error for {topic}: {e}");
-        }
-    }
-    info!("MQTT connected and subscribed");
-
-    loop {
-        match event_loop.poll().await {
             Ok(Event::Incoming(Packet::Publish(pub_msg))) => {
                 let topic = &pub_msg.topic;
                 let payload = &pub_msg.payload;
@@ -218,18 +222,38 @@ async fn run_event_loop(
                 }
             }
             Ok(Event::Incoming(Packet::Disconnect)) => {
-                warn!("MQTT disconnected, reconnecting…");
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                warn!(
+                    "MQTT disconnected, retrying in {}s",
+                    MQTT_RECONNECT_DELAY.as_secs()
+                );
+                tokio::time::sleep(MQTT_RECONNECT_DELAY).await;
             }
             Ok(_) => {}
             Err(e) => {
-                error!("MQTT event loop error: {e}");
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                error!(
+                    "MQTT event loop error: {e}; retrying in {}s",
+                    MQTT_RECONNECT_DELAY.as_secs()
+                );
+                tokio::time::sleep(MQTT_RECONNECT_DELAY).await;
             }
         }
     }
 }
 
+async fn subscribe_topics(client: &AsyncClient, base_topic: &str) -> bool {
+    let set_wildcard = format!("{}/+/set", base_topic);
+    let get_wildcard = format!("{}/+/get", base_topic);
+    let permit_topic = format!("{}/bridge/request/permit_join", base_topic);
+
+    for topic in &[&set_wildcard, &get_wildcard, &permit_topic] {
+        if let Err(e) = client.subscribe(*topic, QoS::AtLeastOnce).await {
+            error!("MQTT subscribe error for {topic}: {e}");
+            return false;
+        }
+    }
+
+    true
+}
 /// Parse permit_join payload. Supports z2m JSON format and plain number.
 fn parse_permit_join_payload(payload: &[u8]) -> u8 {
     // Try JSON: {"value": true, "time": 254} or {"value": true}
