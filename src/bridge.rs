@@ -62,51 +62,24 @@ impl Bridge {
         drop(all);
 
         // 4. Connect MQTT
-        let (mqtt, mut mqtt_rx) = MqttBridge::connect(&self.cfg.mqtt)?;
-        mqtt.publish_bridge_state(true).await?;
-        info!("MQTT bridge online (base_topic={})", self.cfg.mqtt.base_topic);
+        let (mqtt, mut mqtt_rx) = MqttBridge::connect(&self.cfg.mqtt).await?;
+        info!(
+            "MQTT connected (base_topic={})",
+            self.cfg.mqtt.base_topic
+        );
 
         // 5. Open coordinator
         let mut coord = open_coordinator(&self.cfg).await?;
         info!("Coordinator ready");
 
-        // 6. Publish bridge/info
-        self.publish_bridge_info(&mqtt, &coord).await;
+        // 6. Publish retained MQTT state
+        self.republish_mqtt_state(&mqtt, &coord).await;
 
         // 7. Permit join if configured
         if self.cfg.permit_join {
             coord.permit_join(254).await?;
             info!("Permit join enabled (254 s)");
         }
-
-        // 8. Publish HA discovery + initial state for all known devices
-        let coordinator_ieee_str = coord
-            .info
-            .ieee_addr
-            .map(|a| a.as_hex())
-            .unwrap_or_default();
-        for dev in self.devices.all_devices() {
-            // Publish initial state so HA sees the device immediately
-            let state = serde_json::Value::Object(dev.state.clone());
-            if let Err(e) = mqtt.publish_device_state(&dev.friendly_name, &state).await {
-                warn!("Failed to publish state for {}: {e}", dev.friendly_name);
-            }
-
-            // Publish HA discovery
-            if self.cfg.homeassistant && dev.interview_complete {
-                info!("Publishing HA discovery for {}", dev.friendly_name);
-                homeassistant::publish_discovery(
-                    &mqtt,
-                    &dev,
-                    &self.cfg.mqtt.base_topic,
-                    &coordinator_ieee_str,
-                )
-                .await;
-            }
-        }
-
-        // 9. Publish device list
-        self.publish_device_list(&mqtt).await;
         info!("Startup complete, entering main loop");
 
         let devices = Arc::clone(&self.devices);
@@ -290,6 +263,10 @@ impl Bridge {
                 cmd = mqtt_rx.recv() => {
                     match cmd {
                         None => break,
+                        Some(MqttCommand::Connected) => {
+                            info!("MQTT session restored, republishing retained state");
+                            self.republish_mqtt_state(&mqtt, &coord).await;
+                        }
                         Some(MqttCommand::PermitJoin { duration }) => {
                             info!("Permit join: {duration}s");
                             if let Err(e) = coord.permit_join(duration).await {
@@ -388,6 +365,39 @@ impl Bridge {
         if let Err(e) = mqtt.publish_bridge_info(&info).await {
             warn!("Failed to publish bridge info: {e}");
         }
+    }
+
+    async fn republish_mqtt_state(&self, mqtt: &MqttBridge, coord: &CoordinatorHandle) {
+        if let Err(e) = mqtt.publish_bridge_state(true).await {
+            warn!("Failed to publish online state: {e}");
+        }
+
+        self.publish_bridge_info(mqtt, coord).await;
+
+        let coordinator_ieee_str = coord
+            .info
+            .ieee_addr
+            .map(|a| a.as_hex())
+            .unwrap_or_default();
+
+        for dev in self.devices.all_devices() {
+            let state = serde_json::Value::Object(dev.state.clone());
+            if let Err(e) = mqtt.publish_device_state(&dev.friendly_name, &state).await {
+                warn!("Failed to publish state for {}: {e}", dev.friendly_name);
+            }
+
+            if self.cfg.homeassistant && dev.interview_complete {
+                homeassistant::publish_discovery(
+                    mqtt,
+                    &dev,
+                    &self.cfg.mqtt.base_topic,
+                    &coordinator_ieee_str,
+                )
+                .await;
+            }
+        }
+
+        self.publish_device_list(mqtt).await;
     }
 
     async fn handle_set(
