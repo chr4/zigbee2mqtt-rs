@@ -200,6 +200,7 @@ mod zdo {
     pub const IEEE_ADDR_REQ: u8 = 0x01;
     pub const SIMPLE_DESC_REQ: u8 = 0x04;
     pub const ACTIVE_EP_REQ: u8 = 0x05;
+    pub const BIND_REQ: u8 = 0x21;
     pub const PERMIT_JOIN_REQ: u8 = 0x36;
     pub const STARTUP_FROM_APP: u8 = 0x40;
 }
@@ -245,6 +246,36 @@ pub fn zdo_ieee_addr_req(nwk_addr: u16) -> ZnpFrame {
     ZnpFrame::sreq(Subsystem::Zdo, zdo::IEEE_ADDR_REQ, data)
 }
 
+/// Bind `cluster_id` on `src_ieee`'s `src_ep` to `dst_ieee`'s `dst_ep`
+/// (normally the coordinator's own IEEE address + endpoint). Devices whose
+/// relevant clusters are *output* clusters (e.g. remote controls, whose
+/// button presses are genOnOff/genLevelCtrl/genScenes commands) only ever
+/// unicast those commands to a device they're bound to -- without this,
+/// they have nowhere to send commands and produce no Zigbee traffic at all.
+///
+/// `dst_addr` (the MT-layer "DstAddr") is the address the *request itself*
+/// is routed to, i.e. the NWK address of the device whose binding table is
+/// being modified -- that's `src_ieee`'s own NWK address, not the bind
+/// target's.
+pub fn zdo_bind_req(
+    dst_addr: u16,
+    src_ieee: [u8; 8],
+    src_ep: u8,
+    cluster_id: u16,
+    dst_ieee: [u8; 8],
+    dst_ep: u8,
+) -> ZnpFrame {
+    let mut data = Vec::with_capacity(2 + 8 + 1 + 2 + 1 + 8 + 1);
+    data.extend_from_slice(&dst_addr.to_le_bytes());
+    data.extend_from_slice(&src_ieee);
+    data.push(src_ep);
+    data.extend_from_slice(&cluster_id.to_le_bytes());
+    data.push(0x03); // DstAddrMode: 64-bit IEEE addressing
+    data.extend_from_slice(&dst_ieee);
+    data.push(dst_ep);
+    ZnpFrame::sreq(Subsystem::Zdo, zdo::BIND_REQ, data)
+}
+
 /// ZDO_IEEE_ADDR_RSP (AREQ cmd1=0x81)
 #[derive(Debug, Clone)]
 pub struct IeeeAddrRsp {
@@ -264,7 +295,10 @@ impl IeeeAddrRsp {
         let mut ieee = [0u8; 8];
         ieee.copy_from_slice(&data[1..9]);
         let nwk_addr = u16::from_le_bytes([data[9], data[10]]);
-        Some(Self { ieee_addr: ieee, nwk_addr })
+        Some(Self {
+            ieee_addr: ieee,
+            nwk_addr,
+        })
     }
 }
 
@@ -377,6 +411,24 @@ impl SimpleDescRsp {
             input_clusters,
             output_clusters,
         })
+    }
+}
+
+/// ZDO_BIND_RSP (AREQ cmd1=0xA1)
+#[derive(Debug, Clone)]
+pub struct BindRsp {
+    pub nwk_addr: u16,
+    pub status: u8,
+}
+
+impl BindRsp {
+    pub fn parse(data: &[u8]) -> Option<Self> {
+        if data.len() < 3 {
+            return None;
+        }
+        let nwk_addr = u16::from_le_bytes([data[0], data[1]]);
+        let status = data[2];
+        Some(Self { nwk_addr, status })
     }
 }
 
@@ -548,5 +600,45 @@ mod tests {
     #[test]
     fn sys_version_rsp_parse_too_short() {
         assert!(SysVersionRsp::parse(&[1, 2, 3]).is_none());
+    }
+
+    #[test]
+    fn zdo_bind_req_format() {
+        let src_ieee = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
+        let dst_ieee = [0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18];
+        let frame = zdo_bind_req(0x1234, src_ieee, 1, 0x0006, dst_ieee, 1);
+
+        assert_eq!(frame.frame_type, FrameType::SReq);
+        assert_eq!(frame.subsystem, Subsystem::Zdo);
+        assert_eq!(frame.cmd1, 0x21);
+
+        assert_eq!(u16::from_le_bytes([frame.data[0], frame.data[1]]), 0x1234);
+        assert_eq!(frame.data[2..10], src_ieee);
+        assert_eq!(frame.data[10], 1); // src_ep
+        assert_eq!(u16::from_le_bytes([frame.data[11], frame.data[12]]), 0x0006);
+        assert_eq!(frame.data[13], 0x03); // DstAddrMode: 64-bit IEEE
+        assert_eq!(frame.data[14..22], dst_ieee);
+        assert_eq!(frame.data[22], 1); // dst_ep
+        assert_eq!(frame.data.len(), 23);
+    }
+
+    #[test]
+    fn parse_bind_rsp_success() {
+        let data = vec![0x34, 0x12, 0x00];
+        let rsp = BindRsp::parse(&data).unwrap();
+        assert_eq!(rsp.nwk_addr, 0x1234);
+        assert_eq!(rsp.status, 0);
+    }
+
+    #[test]
+    fn parse_bind_rsp_failure_status() {
+        let data = vec![0x34, 0x12, 0xAF];
+        let rsp = BindRsp::parse(&data).unwrap();
+        assert_eq!(rsp.status, 0xAF);
+    }
+
+    #[test]
+    fn parse_bind_rsp_too_short() {
+        assert!(BindRsp::parse(&[0x00, 0x00]).is_none());
     }
 }

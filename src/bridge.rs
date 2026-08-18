@@ -1,12 +1,15 @@
 /// The main bridge -- ties coordinator, MQTT, device registry, and ZCL together.
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::json;
+use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
 use std::path::PathBuf;
 
 use crate::config::Config;
+use crate::coordinator::znp::ZnpHandle;
 use crate::coordinator::{open_coordinator, CoordinatorEvent, CoordinatorHandle};
 use crate::database;
 use crate::devices::{Device, DeviceRegistry};
@@ -63,10 +66,7 @@ impl Bridge {
 
         // 4. Connect MQTT
         let (mqtt, mut mqtt_rx) = MqttBridge::connect(&self.cfg.mqtt).await?;
-        info!(
-            "MQTT connected (base_topic={})",
-            self.cfg.mqtt.base_topic
-        );
+        info!("MQTT connected (base_topic={})", self.cfg.mqtt.base_topic);
 
         // 5. Open coordinator
         let mut coord = open_coordinator(&self.cfg).await?;
@@ -86,11 +86,7 @@ impl Bridge {
         let base_topic = self.cfg.mqtt.base_topic.clone();
         let ha_enabled = self.cfg.homeassistant;
         let device_configs = self.cfg.devices.clone();
-        let coordinator_ieee = coord
-            .info
-            .ieee_addr
-            .map(|a| a.as_hex())
-            .unwrap_or_default();
+        let coordinator_ieee = coord.info.ieee_addr.map(|a| a.as_hex()).unwrap_or_default();
 
         // 7. Main event loop
         let mut trans_id: u8 = 0;
@@ -125,9 +121,7 @@ impl Bridge {
                             if let Err(e) = mqtt.publish_bridge_log("info", &format!("Device joined: {ieee}")).await {
                                 warn!("Failed to publish bridge log: {e}");
                             }
-                            if let Err(e) = coord.request_active_eps(nwk_addr).await {
-                                warn!("Failed to request active endpoints: {e}");
-                            }
+                            Self::spawn_interview_retry(Arc::clone(&devices), Arc::clone(&coord.inner), ieee, nwk_addr);
                         }
 
                         Some(CoordinatorEvent::DeviceLeft { ieee_addr, .. }) => {
@@ -161,9 +155,7 @@ impl Bridge {
 
                             // Trigger interview if not done yet
                             if devices.get_by_ieee(&ieee).is_some_and(|d| !d.interview_complete) {
-                                if let Err(e) = coord.request_active_eps(nwk_addr).await {
-                                    warn!("Failed to request active endpoints: {e}");
-                                }
+                                Self::spawn_interview_retry(Arc::clone(&devices), Arc::clone(&coord.inner), ieee, nwk_addr);
                             }
                         }
 
@@ -173,6 +165,14 @@ impl Bridge {
                                 if let Err(e) = coord.request_simple_desc(nwk_addr, ep).await {
                                     warn!("Failed to request simple descriptor: {e}");
                                 }
+                            }
+                        }
+
+                        Some(CoordinatorEvent::BindRsp { nwk_addr, status }) => {
+                            if status == 0 {
+                                debug!("Bind succeeded for 0x{nwk_addr:04X}");
+                            } else {
+                                warn!("Bind failed for 0x{nwk_addr:04X}: status=0x{status:02X}");
                             }
                         }
 
@@ -186,10 +186,11 @@ impl Bridge {
                                 profile_id,
                                 device_id,
                                 input_clusters: input_clusters.clone(),
-                                output_clusters,
+                                output_clusters: output_clusters.clone(),
                             };
 
                             let mut interview_just_completed = false;
+                            let mut src_ieee: Option<IeeeAddr> = None;
                             if let Some(mut dev) = devices.get_mut_by_nwk(nwk_addr) {
                                 dev.endpoints.retain(|e| e.endpoint != endpoint);
                                 dev.endpoints.push(ep_desc);
@@ -198,6 +199,28 @@ impl Bridge {
                                     interview_just_completed = true;
                                     info!("Interview complete for {}", dev.display_name());
                                 }
+                                src_ieee = Some(dev.ieee_addr);
+                            }
+
+                            // Bind this endpoint's output clusters to the coordinator so
+                            // devices whose relevant clusters are *output* clusters (e.g.
+                            // remote controls -- button presses are genOnOff/genLevelCtrl/
+                            // genScenes commands) have somewhere to unicast their commands.
+                            // Without this, such devices join fine but produce no Zigbee
+                            // traffic at all when used.
+                            if let Some(dst_ieee) = coord.info.ieee_addr {
+                                if let Some(src_ieee) = src_ieee {
+                                    for &cluster_id in &output_clusters {
+                                        if let Err(e) = coord
+                                            .request_bind(nwk_addr, src_ieee.0, endpoint, cluster_id, dst_ieee.0, 1)
+                                            .await
+                                        {
+                                            warn!("Failed to request bind for 0x{nwk_addr:04X} ep={endpoint} cluster=0x{cluster_id:04X}: {e}");
+                                        }
+                                    }
+                                }
+                            } else if !output_clusters.is_empty() {
+                                warn!("Cannot bind 0x{nwk_addr:04X} ep={endpoint}: coordinator IEEE address unknown");
                             }
 
                             // Request basic cluster attributes (manufacturer, model)
@@ -351,10 +374,7 @@ impl Bridge {
     fn apply_device_configs(&self) {
         for (ieee_str, cfg) in &self.cfg.devices {
             if let Some(ieee) = IeeeAddr::from_hex(ieee_str) {
-                let name = cfg
-                    .friendly_name
-                    .clone()
-                    .unwrap_or_else(|| ieee.as_hex());
+                let name = cfg.friendly_name.clone().unwrap_or_else(|| ieee.as_hex());
                 let disabled = cfg.disabled.unwrap_or(false);
 
                 if let Some(mut dev) = self.devices.get_mut_by_ieee(&ieee) {
@@ -373,11 +393,7 @@ impl Bridge {
     }
 
     async fn publish_bridge_info(&self, mqtt: &MqttBridge, coord: &CoordinatorHandle) {
-        let coord_ieee = coord
-            .info
-            .ieee_addr
-            .map(|a| a.as_hex())
-            .unwrap_or_default();
+        let coord_ieee = coord.info.ieee_addr.map(|a| a.as_hex()).unwrap_or_default();
 
         let info = json!({
             "version": env!("CARGO_PKG_VERSION"),
@@ -406,11 +422,7 @@ impl Bridge {
 
         self.publish_bridge_info(mqtt, coord).await;
 
-        let coordinator_ieee_str = coord
-            .info
-            .ieee_addr
-            .map(|a| a.as_hex())
-            .unwrap_or_default();
+        let coordinator_ieee_str = coord.info.ieee_addr.map(|a| a.as_hex()).unwrap_or_default();
 
         for dev in self.devices.all_devices() {
             let state = serde_json::Value::Object(dev.state.clone());
@@ -527,8 +539,7 @@ impl Bridge {
                     color_obj.get("x").and_then(|v| v.as_f64()),
                     color_obj.get("y").and_then(|v| v.as_f64()),
                 ) {
-                    let zcl_payload =
-                        color::move_to_color_xy_payload(*trans_id, x, y, transition);
+                    let zcl_payload = color::move_to_color_xy_payload(*trans_id, x, y, transition);
                     *trans_id = trans_id.wrapping_add(1);
                     if let Err(e) = coord
                         .send_zcl(nwk_addr, ep, 0x0300, *trans_id, zcl_payload)
@@ -553,8 +564,7 @@ impl Bridge {
                     {
                         warn!("Failed to send color HS command: {e}");
                     }
-                    optimistic
-                        .insert("color".into(), json!({"hue": h, "saturation": s}));
+                    optimistic.insert("color".into(), json!({"hue": h, "saturation": s}));
                     optimistic.insert("color_mode".into(), json!("hs"));
                 }
             }
@@ -565,8 +575,7 @@ impl Bridge {
             // Merge with existing device state
             if let Some(mut dev) = devices.get_mut_by_nwk(nwk_addr) {
                 dev.merge_state(optimistic.clone());
-                dev.state
-                    .insert("last_seen".into(), json!(now_iso8601()));
+                dev.state.insert("last_seen".into(), json!(now_iso8601()));
             }
             // Publish the full merged state
             if let Some(dev) = devices.find_by_name(name) {
@@ -579,11 +588,7 @@ impl Bridge {
     }
 
     /// Handle basic cluster (0x0000) Read Attributes Response to update device metadata.
-    fn handle_basic_cluster_response(
-        devices: &DeviceRegistry,
-        src_addr: u16,
-        data: &[u8],
-    ) {
+    fn handle_basic_cluster_response(devices: &DeviceRegistry, src_addr: u16, data: &[u8]) {
         if let Ok(Some(zcl_msg)) = zcl::parse_message(0x0000, data, None) {
             if let Some(mut dev) = devices.get_mut_by_nwk(src_addr) {
                 for (key, value) in &zcl_msg.values {
@@ -639,6 +644,57 @@ impl Bridge {
         if let Err(e) = mqtt.publish_bridge_devices(&json!(list)).await {
             warn!("Failed to publish device list: {e}");
         }
+    }
+
+    /// Spawn a background retry loop for a device's ZDO interview.
+    ///
+    /// A sleepy battery-powered end device (e.g. a remote control) may be
+    /// asleep when the initial ZDO_ACTIVE_EP_REQ goes out over the air and
+    /// simply never see it -- the SREQ/SRSP exchange with the coordinator's
+    /// own radio still succeeds (it only confirms the request was queued),
+    /// so nothing here times out on its own. Without a retry, the device's
+    /// `interview_complete` flag would then never flip true. This polls
+    /// `interview_complete` and re-sends the request a bounded number of
+    /// times with a delay generous enough for such devices to wake up and
+    /// respond, stopping as soon as the real ActiveEpRsp/SimpleDescRsp event
+    /// handling (in the main loop) marks the interview complete.
+    fn spawn_interview_retry(
+        devices: Arc<DeviceRegistry>,
+        znp: Arc<Mutex<ZnpHandle>>,
+        ieee: IeeeAddr,
+        nwk_addr: u16,
+    ) {
+        const MAX_ATTEMPTS: u32 = 3;
+        const RETRY_DELAY: Duration = Duration::from_secs(20);
+
+        tokio::spawn(async move {
+            for attempt in 1..=MAX_ATTEMPTS {
+                if devices
+                    .get_by_ieee(&ieee)
+                    .is_some_and(|d| d.interview_complete)
+                {
+                    return;
+                }
+                if let Err(e) = znp.lock().await.request_active_eps(nwk_addr).await {
+                    warn!(
+                        "Interview attempt {attempt}/{MAX_ATTEMPTS} for {ieee}: \
+                         failed to request active endpoints: {e}"
+                    );
+                }
+                tokio::time::sleep(RETRY_DELAY).await;
+                if devices
+                    .get_by_ieee(&ieee)
+                    .is_some_and(|d| d.interview_complete)
+                {
+                    return;
+                }
+            }
+            warn!(
+                "Interview for {ieee} did not complete after {MAX_ATTEMPTS} attempts -- \
+                 device may be asleep or out of range. It will retry automatically on its \
+                 next join/announce."
+            );
+        });
     }
 }
 

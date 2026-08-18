@@ -1,6 +1,6 @@
-use serde_json::{json, Value};
 use super::super::attribute::AttributeReport;
 use super::ClusterHandler;
+use serde_json::{json, Value};
 
 pub struct IasZoneCluster;
 
@@ -152,8 +152,12 @@ mod tests {
             value: AttributeValue::U16(0x0000), // all clear
         }];
         let result = IasZoneCluster.process_reports(&reports);
-        assert!(result.iter().any(|(k, v)| k == "contact" && v == &json!(true)));
-        assert!(result.iter().any(|(k, v)| k == "tamper" && v == &json!(false)));
+        assert!(result
+            .iter()
+            .any(|(k, v)| k == "contact" && v == &json!(true)));
+        assert!(result
+            .iter()
+            .any(|(k, v)| k == "tamper" && v == &json!(false)));
     }
 
     #[test]
@@ -163,7 +167,9 @@ mod tests {
             value: AttributeValue::U16(0x0001), // ALARM1 = open
         }];
         let result = IasZoneCluster.process_reports(&reports);
-        assert!(result.iter().any(|(k, v)| k == "contact" && v == &json!(false)));
+        assert!(result
+            .iter()
+            .any(|(k, v)| k == "contact" && v == &json!(false)));
     }
 
     #[test]
@@ -173,7 +179,9 @@ mod tests {
             value: AttributeValue::U16(0x0004), // TAMPER
         }];
         let result = IasZoneCluster.process_reports(&reports);
-        assert!(result.iter().any(|(k, v)| k == "tamper" && v == &json!(true)));
+        assert!(result
+            .iter()
+            .any(|(k, v)| k == "tamper" && v == &json!(true)));
     }
 
     #[test]
@@ -181,45 +189,61 @@ mod tests {
         // Command 0x00 with zone_status = open + tamper
         let payload = [0x05, 0x00, 0x00, 0x01, 0x00, 0x00]; // status=0x0005
         let result = IasZoneCluster.process_command(0x00, &payload);
-        assert!(result.iter().any(|(k, v)| k == "contact" && v == &json!(false)));
-        assert!(result.iter().any(|(k, v)| k == "tamper" && v == &json!(true)));
+        assert!(result
+            .iter()
+            .any(|(k, v)| k == "contact" && v == &json!(false)));
+        assert!(result
+            .iter()
+            .any(|(k, v)| k == "tamper" && v == &json!(true)));
     }
 
     #[test]
     fn motion_sensor_zone_type_reports_occupancy_not_contact() {
         let result = decode_zone_status(0x0001, Some(ZONE_TYPE_MOTION_SENSOR));
-        assert!(result.iter().any(|(k, v)| k == "occupancy" && v == &json!(true)));
+        assert!(result
+            .iter()
+            .any(|(k, v)| k == "occupancy" && v == &json!(true)));
         assert!(!result.iter().any(|(k, _)| k == "contact"));
     }
 
     #[test]
     fn motion_sensor_zone_type_clear() {
         let result = decode_zone_status(0x0000, Some(ZONE_TYPE_MOTION_SENSOR));
-        assert!(result.iter().any(|(k, v)| k == "occupancy" && v == &json!(false)));
+        assert!(result
+            .iter()
+            .any(|(k, v)| k == "occupancy" && v == &json!(false)));
     }
 
     #[test]
     fn water_sensor_zone_type_reports_water_leak() {
         let result = decode_zone_status(0x0001, Some(ZONE_TYPE_WATER_SENSOR));
-        assert!(result.iter().any(|(k, v)| k == "water_leak" && v == &json!(true)));
+        assert!(result
+            .iter()
+            .any(|(k, v)| k == "water_leak" && v == &json!(true)));
     }
 
     #[test]
     fn fire_sensor_zone_type_reports_smoke() {
         let result = decode_zone_status(0x0001, Some(ZONE_TYPE_FIRE_SENSOR));
-        assert!(result.iter().any(|(k, v)| k == "smoke" && v == &json!(true)));
+        assert!(result
+            .iter()
+            .any(|(k, v)| k == "smoke" && v == &json!(true)));
     }
 
     #[test]
     fn unknown_zone_type_falls_back_to_contact() {
         let result = decode_zone_status(0x0001, Some(0x9999));
-        assert!(result.iter().any(|(k, v)| k == "contact" && v == &json!(false)));
+        assert!(result
+            .iter()
+            .any(|(k, v)| k == "contact" && v == &json!(false)));
     }
 
     #[test]
     fn no_zone_type_falls_back_to_contact() {
         let result = decode_zone_status(0x0000, None);
-        assert!(result.iter().any(|(k, v)| k == "contact" && v == &json!(true)));
+        assert!(result
+            .iter()
+            .any(|(k, v)| k == "contact" && v == &json!(true)));
     }
 
     #[test]

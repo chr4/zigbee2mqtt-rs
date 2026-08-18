@@ -76,9 +76,7 @@ impl ZnpCoordinator {
 
     async fn reset(&mut self) -> Result<()> {
         info!("Resetting ZNP coordinator (soft reset)…");
-        self.transport
-            .send(sys_reset_req(ResetType::Soft))
-            .await?;
+        self.transport.send(sys_reset_req(ResetType::Soft)).await?;
 
         // Wait for SYS_RESET_IND from the device
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -169,7 +167,10 @@ impl ZnpCoordinator {
             .request(app_cnf_bdb_set_channel(channel_mask, true))
             .await?;
         if rsp.data.first().copied() != Some(0) {
-            warn!("BDB set primary channel returned non-zero status: {:?}", rsp.data);
+            warn!(
+                "BDB set primary channel returned non-zero status: {:?}",
+                rsp.data
+            );
         }
 
         // Clear secondary channel
@@ -178,7 +179,10 @@ impl ZnpCoordinator {
             .request(app_cnf_bdb_set_channel(0, false))
             .await?;
         if rsp.data.first().copied() != Some(0) {
-            warn!("BDB set secondary channel returned non-zero status: {:?}", rsp.data);
+            warn!(
+                "BDB set secondary channel returned non-zero status: {:?}",
+                rsp.data
+            );
         }
 
         info!("Zigbee channel set to {channel}");
@@ -188,7 +192,7 @@ impl ZnpCoordinator {
     async fn register_endpoints(&self) -> Result<()> {
         // Register endpoint 1 (HA profile) – receives ZCL cluster traffic
         let input_clusters: Vec<u16> = vec![
-            0x0000, 0x0001, 0x0006, 0x0008, 0x0300, 0x0400, 0x0402, 0x0405, 0x0406, 0x0500,
+            0x0000, 0x0001, 0x0005, 0x0006, 0x0008, 0x0300, 0x0400, 0x0402, 0x0405, 0x0406, 0x0500,
             0x0B04,
         ];
         let output_clusters: Vec<u16> = vec![0x0006, 0x0008, 0x0300];
@@ -210,10 +214,7 @@ impl ZnpCoordinator {
     }
 
     async fn start_network(&self) -> Result<()> {
-        let rsp = self
-            .transport
-            .request(zdo_startup_from_app(100))
-            .await?;
+        let rsp = self.transport.request(zdo_startup_from_app(100)).await?;
         match rsp.data.first().copied() {
             Some(0) => info!("ZDO startup: new network formed"),
             Some(1) => info!("ZDO startup: rejoined existing network"),
@@ -282,6 +283,10 @@ async fn event_pump(mut znp_rx: mpsc::Receiver<ZnpEvent>, out: mpsc::Sender<Coor
                     nwk_addr: r.nwk_addr,
                 })
             }
+            ZnpEvent::BindRsp(data) => BindRsp::parse(&data).map(|r| CoordinatorEvent::BindRsp {
+                nwk_addr: r.nwk_addr,
+                status: r.status,
+            }),
             ZnpEvent::TcDevInd(data) => {
                 // TC_DEV_IND: SrcAddr(u16) + IEEEAddr(8) + ParentAddr(u16)
                 if data.len() >= 10 {
@@ -340,8 +345,24 @@ impl ZnpHandle {
     }
 
     pub async fn request_ieee_addr(&self, nwk_addr: u16) -> Result<()> {
+        self.transport.request(zdo_ieee_addr_req(nwk_addr)).await?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn request_bind(
+        &self,
+        dst_addr: u16,
+        src_ieee: [u8; 8],
+        src_ep: u8,
+        cluster_id: u16,
+        dst_ieee: [u8; 8],
+        dst_ep: u8,
+    ) -> Result<()> {
         self.transport
-            .request(zdo_ieee_addr_req(nwk_addr))
+            .request(zdo_bind_req(
+                dst_addr, src_ieee, src_ep, cluster_id, dst_ieee, dst_ep,
+            ))
             .await?;
         Ok(())
     }

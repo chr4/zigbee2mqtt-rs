@@ -41,6 +41,11 @@ pub enum CoordinatorEvent {
         input_clusters: Vec<u16>,
         output_clusters: Vec<u16>,
     },
+    /// Result of a ZDO_BIND_REQ (see `CoordinatorHandle::request_bind`).
+    BindRsp {
+        nwk_addr: u16,
+        status: u8,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -89,10 +94,26 @@ impl CoordinatorHandle {
     }
 
     pub async fn request_ieee_addr(&self, nwk_addr: u16) -> Result<()> {
+        self.inner.lock().await.request_ieee_addr(nwk_addr).await
+    }
+
+    /// Bind `cluster_id` on the device at `dst_addr`'s `src_ep` to `dst_ieee`'s
+    /// `dst_ep` (normally this coordinator's own address). See
+    /// `znp::commands::zdo_bind_req` for why this is needed.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn request_bind(
+        &self,
+        dst_addr: u16,
+        src_ieee: [u8; 8],
+        src_ep: u8,
+        cluster_id: u16,
+        dst_ieee: [u8; 8],
+        dst_ep: u8,
+    ) -> Result<()> {
         self.inner
             .lock()
             .await
-            .request_ieee_addr(nwk_addr)
+            .request_bind(dst_addr, src_ieee, src_ep, cluster_id, dst_ieee, dst_ep)
             .await
     }
 }
@@ -103,8 +124,8 @@ pub async fn open_coordinator(cfg: &Config) -> Result<CoordinatorHandle> {
             let coord = ZnpCoordinator::open(&cfg.serial.port, cfg.serial.baudrate)?;
             coord.start(cfg).await
         }
-        AdapterType::Ezsp => {
-            Err(crate::error::Error::Config("EZSP adapter not yet supported".into()))
-        }
+        AdapterType::Ezsp => Err(crate::error::Error::Config(
+            "EZSP adapter not yet supported".into(),
+        )),
     }
 }

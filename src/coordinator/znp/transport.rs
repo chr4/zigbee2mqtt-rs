@@ -38,6 +38,7 @@ pub enum ZnpEvent {
     ActiveEpRsp(Vec<u8>),
     SimpleDescRsp(Vec<u8>),
     IeeeAddrRsp(Vec<u8>),
+    BindRsp(Vec<u8>),
     TcDevInd(Vec<u8>),
     StateChangeInd,
     Other,
@@ -47,9 +48,9 @@ pub enum ZnpEvent {
 enum ActorMsg {
     Send(ZnpFrame),
     Request {
-        frame:      ZnpFrame,
-        id:         u64,
-        reply_tx:   oneshot::Sender<Result<ZnpFrame>>,
+        frame: ZnpFrame,
+        id: u64,
+        reply_tx: oneshot::Sender<Result<ZnpFrame>>,
     },
     /// Sent by the client when a request's timeout elapses, so the actor can
     /// drop a stale `pending` entry instead of risking it being matched
@@ -61,10 +62,10 @@ enum ActorMsg {
 // ── Actor task ────────────────────────────────────────────────────────────────
 
 struct TransportActor {
-    framed:     Framed<tokio_serial::SerialStream, ZnpCodec>,
-    actor_rx:   mpsc::Receiver<ActorMsg>,
-    event_tx:   mpsc::Sender<ZnpEvent>,
-    pending:    Option<PendingRequest>,
+    framed: Framed<tokio_serial::SerialStream, ZnpCodec>,
+    actor_rx: mpsc::Receiver<ActorMsg>,
+    event_tx: mpsc::Sender<ZnpEvent>,
+    pending: Option<PendingRequest>,
 }
 
 struct PendingRequest {
@@ -135,7 +136,9 @@ impl TransportActor {
 
         if frame.frame_type == FrameType::SRsp {
             if let Some(pending) = &self.pending {
-                if frame.subsystem as u8 == pending.expected_sub && frame.cmd1 == pending.expected_cmd1 {
+                if frame.subsystem as u8 == pending.expected_sub
+                    && frame.cmd1 == pending.expected_cmd1
+                {
                     let pending = self.pending.take().unwrap();
                     let _ = pending.reply_tx.send(Ok(frame));
                     return;
@@ -165,6 +168,7 @@ impl TransportActor {
             (Subsystem::Zdo, 0x81) => ZnpEvent::IeeeAddrRsp(frame.data),
             (Subsystem::Zdo, 0x84) => ZnpEvent::SimpleDescRsp(frame.data),
             (Subsystem::Zdo, 0x85) => ZnpEvent::ActiveEpRsp(frame.data),
+            (Subsystem::Zdo, 0xA1) => ZnpEvent::BindRsp(frame.data),
             (Subsystem::Zdo, 0xC0) => ZnpEvent::StateChangeInd,
             (Subsystem::Zdo, 0xC1) => ZnpEvent::EndDeviceAnnceInd(frame.data),
             (Subsystem::Zdo, 0xC9) => ZnpEvent::LeaveInd(frame.data),
@@ -198,10 +202,21 @@ impl ZnpTransport {
         let (actor_tx, actor_rx) = mpsc::channel::<ActorMsg>(CHANNEL_CAPACITY);
         let (event_tx, event_rx) = mpsc::channel::<ZnpEvent>(CHANNEL_CAPACITY);
 
-        let actor = TransportActor { framed, actor_rx, event_tx, pending: None };
+        let actor = TransportActor {
+            framed,
+            actor_rx,
+            event_tx,
+            pending: None,
+        };
         tokio::spawn(actor.run());
 
-        Ok((Self { actor_tx, next_id: Arc::new(AtomicU64::new(0)) }, event_rx))
+        Ok((
+            Self {
+                actor_tx,
+                next_id: Arc::new(AtomicU64::new(0)),
+            },
+            event_rx,
+        ))
     }
 
     /// Fire-and-forget AREQ send.
@@ -217,7 +232,11 @@ impl ZnpTransport {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (reply_tx, reply_rx) = oneshot::channel();
         self.actor_tx
-            .send(ActorMsg::Request { frame, id, reply_tx })
+            .send(ActorMsg::Request {
+                frame,
+                id,
+                reply_tx,
+            })
             .await
             .map_err(|_| Error::ChannelClosed)?;
 

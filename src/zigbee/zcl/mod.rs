@@ -5,8 +5,8 @@ pub mod frame;
 use serde_json::{Map, Value};
 
 use attribute::AttributeReport;
-use clusters::handler_for;
-use frame::{ZclFrameHeader, FrameType, global};
+use clusters::{handler_for, ClusterHandler};
+use frame::{global, FrameType, ZclFrameHeader};
 
 use crate::error::Result;
 
@@ -43,8 +43,39 @@ pub fn parse_message(
                 let reports = parse_read_attr_rsp(payload);
                 clusters::ias_zone::process_reports_with_zone_type(&reports, zone_type)
             }
+            FrameType::ClusterSpecific => clusters::ias_zone::process_command_with_zone_type(
+                header.command_id,
+                payload,
+                zone_type,
+            ),
+            FrameType::Global => return Ok(None),
+        }
+    } else if cluster_id == 0x0005 {
+        // Scenes' manufacturer-specific commands need the manufacturer code
+        // from the frame header, which the generic ClusterHandler trait has
+        // no way to carry -- bypass it the same way IAS Zone bypasses it for
+        // zone_type above.
+        match header.frame_type {
+            FrameType::Global if header.command_id == global::REPORT_ATTRIBUTES => {
+                let reports = AttributeReport::parse_all(payload);
+                clusters::scenes::ScenesCluster.process_reports(&reports)
+            }
+            FrameType::Global if header.command_id == global::READ_ATTRIBUTES_RSP => {
+                let reports = parse_read_attr_rsp(payload);
+                clusters::scenes::ScenesCluster.process_reports(&reports)
+            }
             FrameType::ClusterSpecific => {
-                clusters::ias_zone::process_command_with_zone_type(header.command_id, payload, zone_type)
+                if let Some(mfr) = header.mfr_code {
+                    tracing::info!(
+                        "Manufacturer-specific Scenes command: mfr=0x{mfr:04X} cmd=0x{:02X} payload={:02X?}",
+                        header.command_id, payload
+                    );
+                }
+                clusters::scenes::process_command_with_mfr_code(
+                    header.command_id,
+                    payload,
+                    header.mfr_code,
+                )
             }
             FrameType::Global => return Ok(None),
         }
@@ -105,12 +136,14 @@ fn parse_read_attr_rsp(buf: &[u8]) -> Vec<AttributeReport> {
     let mut pos = 0;
     while pos + 3 <= buf.len() {
         let attr_id = u16::from_le_bytes([buf[pos], buf[pos + 1]]);
-        let status  = buf[pos + 2];
+        let status = buf[pos + 2];
         pos += 3;
         if status != 0x00 {
             continue; // attribute not found
         }
-        if pos >= buf.len() { break; }
+        if pos >= buf.len() {
+            break;
+        }
         let data_type = attribute::DataType::from_u8(buf[pos]);
         pos += 1;
         match attribute::AttributeValue::parse(data_type, &buf[pos..]) {
@@ -240,5 +273,24 @@ mod tests {
     fn extract_ias_zone_type_none_for_other_commands() {
         let raw = [0x01, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00];
         assert_eq!(extract_ias_zone_type(&raw).unwrap(), None);
+    }
+
+    #[test]
+    fn parse_scenes_recall_command() {
+        let raw = [
+            0x01, 0x01, 0x05, // cluster-specific, seq=1, cmd=Recall Scene
+            0x01, 0x00, 0x05, // group=1, scene=5
+        ];
+        let msg = parse_message(0x0005, &raw, None).unwrap().unwrap();
+        assert_eq!(msg.values["action"], "recall");
+        assert_eq!(msg.values["action_scene"], 5);
+    }
+
+    #[test]
+    fn parse_scenes_manufacturer_specific_command() {
+        // Frame control: cluster-specific | manufacturer-specific, mfr=0x117C (IKEA)
+        let raw = [0x05, 0x7C, 0x11, 0x01, 0x07];
+        let msg = parse_message(0x0005, &raw, None).unwrap().unwrap();
+        assert_eq!(msg.values["action"], "manufacturer_0x117c_cmd_0x07");
     }
 }

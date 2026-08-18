@@ -24,6 +24,10 @@ pub enum FrameType {
 pub struct ZclFrameHeader {
     pub frame_type: FrameType,
     pub command_id: u8,
+    /// Manufacturer code, present when the frame control's manufacturer-
+    /// specific bit is set (e.g. IKEA TRADFRI remotes' extra Scenes commands
+    /// -- see `clusters::scenes`).
+    pub mfr_code: Option<u16>,
 }
 
 impl ZclFrameHeader {
@@ -40,12 +44,16 @@ impl ZclFrameHeader {
         let mfr_specific = (fc & 0x04) != 0;
 
         let mut pos = 1usize;
-        if mfr_specific {
+        let mfr_code = if mfr_specific {
             if buf.len() < pos + 2 {
                 return Err(Error::Zcl("truncated manufacturer code".into()));
             }
+            let code = u16::from_le_bytes([buf[pos], buf[pos + 1]]);
             pos += 2;
-        }
+            Some(code)
+        } else {
+            None
+        };
 
         if buf.len() < pos + 2 {
             return Err(Error::Zcl(
@@ -60,6 +68,7 @@ impl ZclFrameHeader {
             ZclFrameHeader {
                 frame_type,
                 command_id,
+                mfr_code,
             },
             pos,
         ))
@@ -83,4 +92,37 @@ pub fn read_attributes_payload(sequence: u8, attr_ids: &[u16]) -> Vec<u8> {
         payload.extend_from_slice(&id.to_le_bytes());
     }
     payload
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_frame_without_mfr_code() {
+        let raw = [0x01, 0x01, 0x02]; // cluster-specific, seq=1, cmd=Toggle
+        let (header, offset) = ZclFrameHeader::parse(&raw).unwrap();
+        assert_eq!(header.frame_type, FrameType::ClusterSpecific);
+        assert_eq!(header.command_id, 0x02);
+        assert_eq!(header.mfr_code, None);
+        assert_eq!(offset, 3);
+    }
+
+    #[test]
+    fn parse_frame_with_mfr_code() {
+        // Frame control: cluster-specific (0x01) | manufacturer-specific (0x04)
+        let raw = [0x05, 0x7C, 0x11, 0x01, 0x07, 0xAA];
+        let (header, offset) = ZclFrameHeader::parse(&raw).unwrap();
+        assert_eq!(header.frame_type, FrameType::ClusterSpecific);
+        assert_eq!(header.mfr_code, Some(0x117C));
+        assert_eq!(header.command_id, 0x07);
+        assert_eq!(offset, 5);
+        assert_eq!(&raw[offset..], [0xAA]);
+    }
+
+    #[test]
+    fn parse_frame_truncated_mfr_code_errors() {
+        let raw = [0x05, 0x7C];
+        assert!(ZclFrameHeader::parse(&raw).is_err());
+    }
 }

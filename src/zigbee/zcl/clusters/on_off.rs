@@ -1,6 +1,6 @@
-use serde_json::{json, Value};
 use super::super::attribute::AttributeReport;
 use super::ClusterHandler;
+use serde_json::{json, Value};
 
 pub struct OnOffCluster;
 
@@ -32,7 +32,7 @@ impl ClusterHandler for OnOffCluster {
             0x00 => vec![("state".into(), json!("OFF"))],
             0x01 => vec![("state".into(), json!("ON"))],
             0x02 => vec![("state".into(), json!("TOGGLE"))],
-            _    => vec![],
+            _ => vec![],
         }
     }
 }
@@ -41,9 +41,9 @@ impl ClusterHandler for OnOffCluster {
 /// `state`: "ON" | "OFF" | "TOGGLE"
 pub fn set_state_payload(sequence: u8, state: &str) -> Option<Vec<u8>> {
     let cmd = match state.to_uppercase().as_str() {
-        "ON"     | "TRUE"  => 0x01u8,
-        "OFF"    | "FALSE" => 0x00u8,
-        "TOGGLE"           => 0x02u8,
+        "ON" | "TRUE" => 0x01u8,
+        "OFF" | "FALSE" => 0x00u8,
+        "TOGGLE" => 0x02u8,
         _ => return None,
     };
     // Cluster-specific, client→server, no mfr, disable default response

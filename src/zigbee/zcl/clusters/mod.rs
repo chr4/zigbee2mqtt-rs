@@ -7,6 +7,7 @@ pub mod level;
 pub mod occupancy;
 pub mod on_off;
 pub mod power;
+pub mod scenes;
 pub mod temperature;
 
 use serde_json::Value;
