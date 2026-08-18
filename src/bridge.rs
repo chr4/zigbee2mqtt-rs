@@ -212,6 +212,20 @@ impl Bridge {
                                 }
                             }
 
+                            // Request IAS Zone ZoneType, so zone status reports can be
+                            // classified correctly (contact/occupancy/smoke/water_leak/...)
+                            // instead of always assumed to be a door/contact sensor.
+                            if input_clusters.contains(&0x0500) {
+                                trans_id = trans_id.wrapping_add(1);
+                                let payload = crate::zigbee::zcl::frame::read_attributes_payload(
+                                    trans_id,
+                                    &[0x0001],
+                                );
+                                if let Err(e) = coord.send_zcl(nwk_addr, endpoint, 0x0500, trans_id, payload).await {
+                                    warn!("Failed to send ZCL read attributes (IAS Zone type): {e}");
+                                }
+                            }
+
                             Self::publish_device_list_static(&devices, &mqtt).await;
 
                             // Publish HA discovery after interview
@@ -238,8 +252,12 @@ impl Bridge {
                             if cluster_id == 0x0000 {
                                 Self::handle_basic_cluster_response(&devices, src_addr, &data);
                             }
+                            if cluster_id == 0x0500 {
+                                Self::handle_ias_zone_type_response(&devices, src_addr, &data);
+                            }
 
-                            match zcl::parse_message(cluster_id, &data) {
+                            let zone_type = devices.get_by_nwk(src_addr).and_then(|d| d.zone_type);
+                            match zcl::parse_message(cluster_id, &data, zone_type) {
                                 Ok(Some(mut zcl_msg)) => {
                                     if cluster_id == 0x0000 {
                                         // Basic cluster attributes (manufacturer/model/
@@ -566,7 +584,7 @@ impl Bridge {
         src_addr: u16,
         data: &[u8],
     ) {
-        if let Ok(Some(zcl_msg)) = zcl::parse_message(0x0000, data) {
+        if let Ok(Some(zcl_msg)) = zcl::parse_message(0x0000, data, None) {
             if let Some(mut dev) = devices.get_mut_by_nwk(src_addr) {
                 for (key, value) in &zcl_msg.values {
                     match key.as_str() {
@@ -593,6 +611,17 @@ impl Bridge {
                         _ => {}
                     }
                 }
+            }
+        }
+    }
+
+    /// Handle IAS Zone (0x0500) Read Attributes Response to learn ZoneType,
+    /// which determines how zone status reports are classified (contact,
+    /// occupancy, smoke, water_leak, ...). No-op for any other ZCL command.
+    fn handle_ias_zone_type_response(devices: &DeviceRegistry, src_addr: u16, data: &[u8]) {
+        if let Ok(Some(zone_type)) = zcl::extract_ias_zone_type(data) {
+            if let Some(mut dev) = devices.get_mut_by_nwk(src_addr) {
+                dev.zone_type = Some(zone_type);
             }
         }
     }

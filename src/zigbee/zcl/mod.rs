@@ -17,34 +17,60 @@ pub struct ZclMessage {
 }
 
 /// Parse a raw ZCL payload (bytes from AF_INCOMING_MSG) and produce a `ZclMessage`.
-pub fn parse_message(cluster_id: u16, raw: &[u8]) -> Result<Option<ZclMessage>> {
+///
+/// `zone_type` is the device's IAS Zone (0x0500) ZoneType attribute, if known
+/// from a prior interview read -- it has no effect for any other cluster.
+/// Plumbing it through here (rather than via the generic `ClusterHandler`
+/// trait, which carries no per-device context) is what lets IAS Zone status
+/// reports be classified as "occupancy"/"smoke"/"water_leak"/etc. instead of
+/// always being reported as a door/contact sensor.
+pub fn parse_message(
+    cluster_id: u16,
+    raw: &[u8],
+    zone_type: Option<u16>,
+) -> Result<Option<ZclMessage>> {
     let (header, payload_offset) = ZclFrameHeader::parse(raw)?;
 
     let payload = &raw[payload_offset..];
 
-    let handler = match handler_for(cluster_id) {
-        Some(h) => h,
-        None => {
-            tracing::debug!("No handler for cluster 0x{cluster_id:04X}");
-            return Ok(None);
-        }
-    };
-
-    let pairs = match header.frame_type {
-        FrameType::Global => {
-            if header.command_id == global::REPORT_ATTRIBUTES {
+    let pairs = if cluster_id == 0x0500 {
+        match header.frame_type {
+            FrameType::Global if header.command_id == global::REPORT_ATTRIBUTES => {
                 let reports = AttributeReport::parse_all(payload);
-                handler.process_reports(&reports)
-            } else if header.command_id == global::READ_ATTRIBUTES_RSP {
-                // Parse Read Attributes Response (includes status byte per attribute)
+                clusters::ias_zone::process_reports_with_zone_type(&reports, zone_type)
+            }
+            FrameType::Global if header.command_id == global::READ_ATTRIBUTES_RSP => {
                 let reports = parse_read_attr_rsp(payload);
-                handler.process_reports(&reports)
-            } else {
+                clusters::ias_zone::process_reports_with_zone_type(&reports, zone_type)
+            }
+            FrameType::ClusterSpecific => {
+                clusters::ias_zone::process_command_with_zone_type(header.command_id, payload, zone_type)
+            }
+            FrameType::Global => return Ok(None),
+        }
+    } else {
+        let handler = match handler_for(cluster_id) {
+            Some(h) => h,
+            None => {
+                tracing::debug!("No handler for cluster 0x{cluster_id:04X}");
                 return Ok(None);
             }
-        }
-        FrameType::ClusterSpecific => {
-            handler.process_command(header.command_id, payload)
+        };
+
+        match header.frame_type {
+            FrameType::Global => {
+                if header.command_id == global::REPORT_ATTRIBUTES {
+                    let reports = AttributeReport::parse_all(payload);
+                    handler.process_reports(&reports)
+                } else if header.command_id == global::READ_ATTRIBUTES_RSP {
+                    // Parse Read Attributes Response (includes status byte per attribute)
+                    let reports = parse_read_attr_rsp(payload);
+                    handler.process_reports(&reports)
+                } else {
+                    return Ok(None);
+                }
+            }
+            FrameType::ClusterSpecific => handler.process_command(header.command_id, payload),
         }
     };
 
@@ -58,6 +84,18 @@ pub fn parse_message(cluster_id: u16, raw: &[u8]) -> Result<Option<ZclMessage>> 
     }
 
     Ok(Some(ZclMessage { values }))
+}
+
+/// Extract the IAS Zone ZoneType attribute from a raw ZCL Read Attributes
+/// Response for cluster 0x0500, if present. Used during interview to learn
+/// how to classify a device's zone status reports.
+pub fn extract_ias_zone_type(raw: &[u8]) -> Result<Option<u16>> {
+    let (header, payload_offset) = ZclFrameHeader::parse(raw)?;
+    if header.frame_type != FrameType::Global || header.command_id != global::READ_ATTRIBUTES_RSP {
+        return Ok(None);
+    }
+    let reports = parse_read_attr_rsp(&raw[payload_offset..]);
+    Ok(clusters::ias_zone::extract_zone_type(&reports))
 }
 
 /// Parse a Read Attributes Response payload into AttributeReports.
@@ -106,7 +144,7 @@ mod tests {
             0x10,       // data_type = Boolean
             0x01,       // value = true
         ];
-        let msg = parse_message(0x0006, &raw).unwrap().unwrap();
+        let msg = parse_message(0x0006, &raw, None).unwrap().unwrap();
         assert_eq!(msg.values["state"], "ON");
     }
 
@@ -119,14 +157,14 @@ mod tests {
             0x29,             // data_type = Int16
             0xCA, 0x08,       // value = 2250 (22.50°C)
         ];
-        let msg = parse_message(0x0402, &raw).unwrap().unwrap();
+        let msg = parse_message(0x0402, &raw, None).unwrap().unwrap();
         assert_eq!(msg.values["temperature"], 22.5);
     }
 
     #[test]
     fn parse_unsupported_cluster() {
         let raw = [0x18, 0x01, 0x0A, 0x00, 0x00, 0x10, 0x01];
-        let result = parse_message(0xFFFF, &raw).unwrap();
+        let result = parse_message(0xFFFF, &raw, None).unwrap();
         assert!(result.is_none());
     }
 
@@ -141,7 +179,7 @@ mod tests {
             // Attribute 0x0005 (model), status=OK, type=CharStr
             0x05, 0x00, 0x00, 0x42, 0x05, b'B', b'U', b'L', b'B', b'1',
         ];
-        let msg = parse_message(0x0000, &raw).unwrap().unwrap();
+        let msg = parse_message(0x0000, &raw, None).unwrap().unwrap();
         assert_eq!(msg.values["manufacturer"], "IKEA");
         assert_eq!(msg.values["model"], "BULB1");
     }
@@ -154,12 +192,53 @@ mod tests {
             0x01, // sequence
             0x01, // command: On
         ];
-        let msg = parse_message(0x0006, &raw).unwrap().unwrap();
+        let msg = parse_message(0x0006, &raw, None).unwrap().unwrap();
         assert_eq!(msg.values["state"], "ON");
     }
 
     #[test]
     fn empty_zcl_frame_errors() {
-        assert!(parse_message(0x0006, &[]).is_err());
+        assert!(parse_message(0x0006, &[], None).is_err());
+    }
+
+    #[test]
+    fn ias_zone_status_change_uses_zone_type() {
+        // Cluster-specific Zone Status Change Notification, status=ALARM1 set
+        let raw = [
+            0x01, // frame control: cluster-specific, client→server
+            0x01, // sequence
+            0x00, // command: Zone Status Change Notification
+            0x01, 0x00, // zone_status = ALARM1
+            0x00, 0x00, 0x00, 0x00, // extended_status, zone_id, delay
+        ];
+        let msg = parse_message(0x0500, &raw, Some(0x000D /* motion sensor */))
+            .unwrap()
+            .unwrap();
+        assert_eq!(msg.values["occupancy"], true);
+        assert!(!msg.values.contains_key("contact"));
+    }
+
+    #[test]
+    fn ias_zone_status_change_defaults_to_contact() {
+        let raw = [0x01, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00];
+        let msg = parse_message(0x0500, &raw, None).unwrap().unwrap();
+        assert_eq!(msg.values["contact"], false);
+    }
+
+    #[test]
+    fn extract_ias_zone_type_from_read_attr_rsp() {
+        #[rustfmt::skip]
+        let raw = [
+            0x18, 0x01, 0x01, // header: global, Read Attributes Response
+            // Attribute 0x0001 (ZoneType), status=OK, type=Enum16, value=0x000D (motion)
+            0x01, 0x00, 0x00, 0x31, 0x0D, 0x00,
+        ];
+        assert_eq!(extract_ias_zone_type(&raw).unwrap(), Some(0x000D));
+    }
+
+    #[test]
+    fn extract_ias_zone_type_none_for_other_commands() {
+        let raw = [0x01, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00];
+        assert_eq!(extract_ias_zone_type(&raw).unwrap(), None);
     }
 }

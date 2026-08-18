@@ -19,6 +19,11 @@ pub struct Device {
     pub power_source: Option<String>,
     #[serde(default)]
     pub sw_build_id: Option<String>,
+    /// IAS Zone (0x0500) ZoneType attribute, when the device exposes that
+    /// cluster. Determines whether a zone status change means "contact",
+    /// "occupancy", "smoke", etc. -- see zigbee::zcl::clusters::ias_zone.
+    #[serde(default)]
+    pub zone_type: Option<u16>,
     /// Last known state values (merged from all cluster reports)
     #[serde(default)]
     pub state: serde_json::Map<String, serde_json::Value>,
@@ -39,6 +44,7 @@ impl Device {
             model: None,
             power_source: None,
             sw_build_id: None,
+            zone_type: None,
             state: serde_json::Map::new(),
             interview_complete: false,
             disabled: false,

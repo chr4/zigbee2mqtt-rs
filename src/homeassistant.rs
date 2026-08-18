@@ -112,21 +112,24 @@ pub async fn publish_discovery(
         publish(mqtt, "binary_sensor", &ieee_hex, "occupancy", &config).await;
     }
 
-    // ── IAS Zone contact sensor ───────────────────────────────────────────
+    // ── IAS Zone sensor (contact/occupancy/smoke/water_leak/...) ──────────
     if clusters.contains(&0x0500) {
+        use crate::zigbee::zcl::clusters::ias_zone;
+        let (field, payload_on, payload_off) = ias_zone::ha_binary_sensor_fields(device.zone_type);
+        let device_class = ias_zone::ha_device_class(device.zone_type);
         let config = json!({
             "availability": availability,
             "state_topic": format!("{}/{}", base_topic, device.friendly_name),
-            "object_id": format!("{}_contact", device.friendly_name),
-            "unique_id": format!("{ieee_hex}_contact_{base_topic}"),
+            "object_id": format!("{}_{field}", device.friendly_name),
+            "unique_id": format!("{ieee_hex}_{field}_{base_topic}"),
             "device": ha_device,
-            "device_class": "door",
-            "value_template": "{{ value_json.contact }}",
-            "payload_on": false,
-            "payload_off": true,
+            "device_class": device_class,
+            "value_template": format!("{{{{ value_json.{field} }}}}"),
+            "payload_on": payload_on,
+            "payload_off": payload_off,
             "enabled_by_default": true,
         });
-        publish(mqtt, "binary_sensor", &ieee_hex, "contact", &config).await;
+        publish(mqtt, "binary_sensor", &ieee_hex, field, &config).await;
     }
 
     // ── Link quality diagnostic sensor ────────────────────────────────────
@@ -520,6 +523,34 @@ mod tests {
         // contact=false means door open (payload_on=false)
         assert_eq!(config["payload_on"], false);
         assert_eq!(config["payload_off"], true);
+    }
+
+    #[test]
+    fn ias_zone_unknown_type_still_falls_back_to_contact() {
+        use crate::zigbee::zcl::clusters::ias_zone;
+        let (field, payload_on, payload_off) = ias_zone::ha_binary_sensor_fields(None);
+        assert_eq!(field, "contact");
+        assert!(!payload_on);
+        assert!(payload_off);
+        assert_eq!(ias_zone::ha_device_class(None), "door");
+    }
+
+    #[test]
+    fn ias_zone_motion_sensor_discovery_uses_occupancy_not_contact() {
+        use crate::zigbee::zcl::clusters::ias_zone;
+        let (field, payload_on, payload_off) = ias_zone::ha_binary_sensor_fields(Some(0x000D));
+        assert_eq!(field, "occupancy");
+        assert!(payload_on);
+        assert!(!payload_off);
+        assert_eq!(ias_zone::ha_device_class(Some(0x000D)), "motion");
+    }
+
+    #[test]
+    fn ias_zone_water_sensor_discovery_uses_water_leak() {
+        use crate::zigbee::zcl::clusters::ias_zone;
+        let (field, ..) = ias_zone::ha_binary_sensor_fields(Some(0x002A));
+        assert_eq!(field, "water_leak");
+        assert_eq!(ias_zone::ha_device_class(Some(0x002A)), "moisture");
     }
 
     #[test]
