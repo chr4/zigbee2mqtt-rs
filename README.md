@@ -52,8 +52,14 @@ module (`nixos/module.nix`) -- no manual cross-compiler setup required.
 nix build .#zigbee2mqtt-rs
 
 # Cross-compiled aarch64 binary (Raspberry Pi 3), built via real Rust cross-
-# compilation -- no QEMU emulation needed
+# compilation -- no QEMU emulation needed. Dynamically linked against glibc;
+# the NixOS module's autoPatchelfHook sets up the interpreter/RPATH for you.
 nix build .#aarch64
+# Binary at: result/bin/zigbee2mqtt-rs
+
+# Fully static aarch64 binary (musl libc) -- no interpreter/RPATH patching
+# needed at all, so it also runs unmodified on non-NixOS systems.
+nix build .#aarch64-musl
 # Binary at: result/bin/zigbee2mqtt-rs
 
 # Without flakes (nix-command/flakes experimental features disabled):

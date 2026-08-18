@@ -22,12 +22,21 @@
       # Per-system outputs (packages, devShells, checks)
       perSystem = flake-utils.lib.eachDefaultSystem (system:
         let
-          overlays    = [ (import rust-overlay) ];
+          overlays    = [
+            (import rust-overlay)
+            # rsync's own test suite needs xattrs/O_NOATIME/etc. that aren't
+            # available in many sandboxed build environments (containers,
+            # CI). It's only ever pulled in here as a transitive build tool,
+            # so skip its checks rather than fail unrelated builds on them.
+            (final: prev: {
+              rsync = prev.rsync.overrideAttrs (_: { doCheck = false; });
+            })
+          ];
           pkgs        = import nixpkgs { inherit system overlays; };
 
-          # Stable Rust with aarch64 cross-compilation target
+          # Stable Rust with aarch64 cross-compilation targets (glibc + musl)
           rustToolchain = pkgs.rust-bin.stable.latest.default.override {
-            targets = [ "aarch64-unknown-linux-gnu" ];
+            targets = [ "aarch64-unknown-linux-gnu" "aarch64-unknown-linux-musl" ];
           };
 
           craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
@@ -89,6 +98,33 @@
             buildInputs = [ pkgsCross.stdenv.cc.cc.lib ];
           };
 
+          # ── Cross-compiled static musl binary (Raspberry Pi 3) ───────────
+          # Fully static -- no libc/libgcc_s to patch at runtime, so it also
+          # runs unmodified on non-NixOS systems.
+          pkgsCrossMusl = import nixpkgs {
+            inherit system overlays;
+            crossSystem.config = "aarch64-unknown-linux-musl";
+          };
+
+          craneLibCrossMusl = (crane.mkLib pkgsCrossMusl).overrideToolchain rustToolchain;
+
+          crossMuslArgs = {
+            src              = craneLib.cleanCargoSource ./.;
+            strictDeps       = true;
+            CARGO_BUILD_TARGET = "aarch64-unknown-linux-musl";
+            CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER =
+              "${pkgsCrossMusl.stdenv.cc}/bin/${pkgsCrossMusl.stdenv.cc.targetPrefix}cc";
+            RUSTFLAGS        = "-C target-feature=+crt-static";
+            nativeBuildInputs = [ pkgsCrossMusl.buildPackages.pkg-config ];
+            buildInputs      = [];
+          };
+
+          cargoArtifactsCrossMusl = craneLibCrossMusl.buildDepsOnly crossMuslArgs;
+
+          zigbee2mqtt-rs-aarch64-musl = craneLibCrossMusl.buildPackage (crossMuslArgs // {
+            cargoArtifacts = cargoArtifactsCrossMusl;
+          });
+
           # ── Checks ───────────────────────────────────────────────────────
           checks = {
             # Run `cargo test`
@@ -109,6 +145,7 @@
             default            = zigbee2mqtt-rs;
             zigbee2mqtt-rs     = zigbee2mqtt-rs;
             aarch64            = zigbee2mqtt-rs-aarch64;
+            aarch64-musl       = zigbee2mqtt-rs-aarch64-musl;
           };
 
           devShells.default = pkgs.mkShell {
