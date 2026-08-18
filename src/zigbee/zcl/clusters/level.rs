@@ -42,48 +42,18 @@ impl ClusterHandler for LevelCluster {
                     ),
                 ]
             }
-            // Move (0x01) and Move / On-Off (0x05): payload = MoveMode(1) + Rate(1)
-            // Sent by e.g. remote controls while a brightness button is held.
-            // There's no absolute level in this payload, so (unlike Move to
-            // Level above) we can't report a `brightness` value -- report the
-            // button action itself instead, matching zigbee2mqtt's convention.
-            0x01 | 0x05 => {
-                if payload.is_empty() {
-                    return vec![];
-                }
-                let direction = if payload[0] == 0 { "up" } else { "down" };
-                let mut out = vec![(
-                    "action".into(),
-                    json!(format!("brightness_move_{direction}")),
-                )];
-                if let Some(&rate) = payload.get(1) {
-                    out.push(("action_rate".into(), json!(rate)));
-                }
-                out
-            }
-            // Step (0x02) and Step / On-Off (0x06):
-            // payload = StepMode(1) + StepSize(1) + TransitionTime(2, LE)
-            0x02 | 0x06 => {
-                if payload.is_empty() {
-                    return vec![];
-                }
-                let direction = if payload[0] == 0 { "up" } else { "down" };
-                let mut out = vec![(
-                    "action".into(),
-                    json!(format!("brightness_step_{direction}")),
-                )];
-                if let Some(&step_size) = payload.get(1) {
-                    out.push(("action_step_size".into(), json!(step_size)));
-                }
-                if payload.len() >= 4 {
-                    let transition_time = u16::from_le_bytes([payload[2], payload[3]]);
-                    out.push(("action_transition_time".into(), json!(transition_time)));
-                }
-                out
-            }
-            // Stop (0x03) and Stop / On-Off (0x07): no payload.
-            // Sent when a brightness button is released.
-            0x03 | 0x07 => vec![("action".into(), json!("brightness_stop"))],
+            // Move/Step/Stop, plain vs. With-On-Off variants: real remotes
+            // (e.g. IKEA TRADFRI) encode which button (up/down) was pressed
+            // by *which command variant* they send, not by the MoveMode/
+            // StepMode payload byte -- mirrors zigbee-herdsman-converters'
+            // `tradfriCommandsLevelCtrl()` exactly (a flat command-id ->
+            // action lookup, payload content unused/irrelevant).
+            0x06 => vec![("action".into(), json!("brightness_up_click"))],
+            0x02 => vec![("action".into(), json!("brightness_down_click"))],
+            0x05 => vec![("action".into(), json!("brightness_up_hold"))],
+            0x07 => vec![("action".into(), json!("brightness_up_release"))],
+            0x01 => vec![("action".into(), json!("brightness_down_hold"))],
+            0x03 => vec![("action".into(), json!("brightness_down_release"))],
             _ => vec![],
         }
     }
@@ -147,63 +117,61 @@ mod tests {
     }
 
     #[test]
-    fn move_command_up() {
-        let result = LevelCluster.process_command(0x01, &[0x00, 0x32]);
-        assert!(result
-            .iter()
-            .any(|(k, v)| k == "action" && v == &json!("brightness_move_up")));
-        assert!(result
-            .iter()
-            .any(|(k, v)| k == "action_rate" && v == &json!(0x32)));
-    }
-
-    #[test]
-    fn move_command_down_with_on_off() {
-        let result = LevelCluster.process_command(0x05, &[0x01, 0x10]);
-        assert!(result
-            .iter()
-            .any(|(k, v)| k == "action" && v == &json!("brightness_move_down")));
-    }
-
-    #[test]
-    fn step_command_up() {
-        let result = LevelCluster.process_command(0x02, &[0x00, 0x1E, 0x0A, 0x00]);
-        assert!(result
-            .iter()
-            .any(|(k, v)| k == "action" && v == &json!("brightness_step_up")));
-        assert!(result
-            .iter()
-            .any(|(k, v)| k == "action_step_size" && v == &json!(0x1E)));
-        assert!(result
-            .iter()
-            .any(|(k, v)| k == "action_transition_time" && v == &json!(10)));
-    }
-
-    #[test]
-    fn step_command_down_with_on_off() {
-        let result = LevelCluster.process_command(0x06, &[0x01, 0x05, 0x00, 0x00]);
-        assert!(result
-            .iter()
-            .any(|(k, v)| k == "action" && v == &json!("brightness_step_down")));
-    }
-
-    #[test]
-    fn stop_command() {
+    fn brightness_up_click() {
         assert_eq!(
-            LevelCluster.process_command(0x03, &[]),
-            vec![("action".into(), json!("brightness_stop"))]
+            LevelCluster.process_command(0x06, &[]),
+            vec![("action".into(), json!("brightness_up_click"))]
         );
+    }
+
+    #[test]
+    fn brightness_down_click() {
+        assert_eq!(
+            LevelCluster.process_command(0x02, &[]),
+            vec![("action".into(), json!("brightness_down_click"))]
+        );
+    }
+
+    #[test]
+    fn brightness_up_hold() {
+        assert_eq!(
+            LevelCluster.process_command(0x05, &[]),
+            vec![("action".into(), json!("brightness_up_hold"))]
+        );
+    }
+
+    #[test]
+    fn brightness_up_release() {
         assert_eq!(
             LevelCluster.process_command(0x07, &[]),
-            vec![("action".into(), json!("brightness_stop"))]
+            vec![("action".into(), json!("brightness_up_release"))]
         );
     }
 
     #[test]
-    fn move_command_empty_payload_ignored() {
+    fn brightness_down_hold() {
         assert_eq!(
             LevelCluster.process_command(0x01, &[]),
-            Vec::<(String, Value)>::new()
+            vec![("action".into(), json!("brightness_down_hold"))]
+        );
+    }
+
+    #[test]
+    fn brightness_down_release() {
+        assert_eq!(
+            LevelCluster.process_command(0x03, &[]),
+            vec![("action".into(), json!("brightness_down_release"))]
+        );
+    }
+
+    #[test]
+    fn payload_content_is_irrelevant_for_move_step_stop() {
+        // Real remotes' payload bytes (MoveMode/StepMode/Rate/StepSize/
+        // TransitionTime) carry no meaning here -- direction comes from the
+        // command id alone. Arbitrary/nonempty payload shouldn't change it.
+        assert_eq!(
+            LevelCluster.process_command(0x06, &[0xFF, 0xFF, 0xFF]),
+            vec![("action".into(), json!("brightness_up_click"))]
         );
     }
 }

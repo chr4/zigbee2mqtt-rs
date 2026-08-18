@@ -14,6 +14,11 @@ use crate::error::Result;
 #[derive(Debug, Clone)]
 pub struct ZclMessage {
     pub values: Map<String, Value>,
+    /// Update to apply to `Device.arrow_hold_direction`, if any -- only ever
+    /// set by IKEA TRADFRI-style genScenes commands (see `clusters::scenes`).
+    /// `None` = leave the device's stored direction unchanged, `Some(None)`
+    /// = clear it, `Some(Some(dir))` = set/replace it.
+    pub arrow_hold_direction: Option<Option<String>>,
 }
 
 /// Parse a raw ZCL payload (bytes from AF_INCOMING_MSG) and produce a `ZclMessage`.
@@ -24,15 +29,21 @@ pub struct ZclMessage {
 /// trait, which carries no per-device context) is what lets IAS Zone status
 /// reports be classified as "occupancy"/"smoke"/"water_leak"/etc. instead of
 /// always being reported as a door/contact sensor.
+///
+/// `held_arrow_direction` is the device's currently-remembered TRADFRI arrow
+/// hold direction (see `clusters::scenes`), if any -- likewise only relevant
+/// to genScenes manufacturer-specific commands.
 pub fn parse_message(
     cluster_id: u16,
     raw: &[u8],
     zone_type: Option<u16>,
+    held_arrow_direction: Option<&str>,
 ) -> Result<Option<ZclMessage>> {
     let (header, payload_offset) = ZclFrameHeader::parse(raw)?;
 
     let payload = &raw[payload_offset..];
 
+    let mut arrow_hold_direction: Option<Option<String>> = None;
     let pairs = if cluster_id == 0x0500 {
         match header.frame_type {
             FrameType::Global if header.command_id == global::REPORT_ATTRIBUTES => {
@@ -71,11 +82,14 @@ pub fn parse_message(
                         header.command_id, payload
                     );
                 }
-                clusters::scenes::process_command_with_mfr_code(
+                let (pairs, direction_update) = clusters::scenes::process_command_with_mfr_code(
                     header.command_id,
                     payload,
                     header.mfr_code,
-                )
+                    held_arrow_direction,
+                );
+                arrow_hold_direction = direction_update;
+                pairs
             }
             FrameType::Global => return Ok(None),
         }
@@ -105,7 +119,7 @@ pub fn parse_message(
         }
     };
 
-    if pairs.is_empty() {
+    if pairs.is_empty() && arrow_hold_direction.is_none() {
         return Ok(None);
     }
 
@@ -114,7 +128,10 @@ pub fn parse_message(
         values.insert(k, v);
     }
 
-    Ok(Some(ZclMessage { values }))
+    Ok(Some(ZclMessage {
+        values,
+        arrow_hold_direction,
+    }))
 }
 
 /// Extract the IAS Zone ZoneType attribute from a raw ZCL Read Attributes
@@ -177,7 +194,7 @@ mod tests {
             0x10,       // data_type = Boolean
             0x01,       // value = true
         ];
-        let msg = parse_message(0x0006, &raw, None).unwrap().unwrap();
+        let msg = parse_message(0x0006, &raw, None, None).unwrap().unwrap();
         assert_eq!(msg.values["state"], "ON");
     }
 
@@ -190,14 +207,14 @@ mod tests {
             0x29,             // data_type = Int16
             0xCA, 0x08,       // value = 2250 (22.50°C)
         ];
-        let msg = parse_message(0x0402, &raw, None).unwrap().unwrap();
+        let msg = parse_message(0x0402, &raw, None, None).unwrap().unwrap();
         assert_eq!(msg.values["temperature"], 22.5);
     }
 
     #[test]
     fn parse_unsupported_cluster() {
         let raw = [0x18, 0x01, 0x0A, 0x00, 0x00, 0x10, 0x01];
-        let result = parse_message(0xFFFF, &raw, None).unwrap();
+        let result = parse_message(0xFFFF, &raw, None, None).unwrap();
         assert!(result.is_none());
     }
 
@@ -212,7 +229,7 @@ mod tests {
             // Attribute 0x0005 (model), status=OK, type=CharStr
             0x05, 0x00, 0x00, 0x42, 0x05, b'B', b'U', b'L', b'B', b'1',
         ];
-        let msg = parse_message(0x0000, &raw, None).unwrap().unwrap();
+        let msg = parse_message(0x0000, &raw, None, None).unwrap().unwrap();
         assert_eq!(msg.values["manufacturer"], "IKEA");
         assert_eq!(msg.values["model"], "BULB1");
     }
@@ -225,13 +242,15 @@ mod tests {
             0x01, // sequence
             0x01, // command: On
         ];
-        let msg = parse_message(0x0006, &raw, None).unwrap().unwrap();
-        assert_eq!(msg.values["state"], "ON");
+        let msg = parse_message(0x0006, &raw, None, None).unwrap().unwrap();
+        // Incoming genOnOff commands are a controller button-press action,
+        // not device state -- see `clusters::on_off`.
+        assert_eq!(msg.values["action"], "on");
     }
 
     #[test]
     fn empty_zcl_frame_errors() {
-        assert!(parse_message(0x0006, &[], None).is_err());
+        assert!(parse_message(0x0006, &[], None, None).is_err());
     }
 
     #[test]
@@ -244,7 +263,7 @@ mod tests {
             0x01, 0x00, // zone_status = ALARM1
             0x00, 0x00, 0x00, 0x00, // extended_status, zone_id, delay
         ];
-        let msg = parse_message(0x0500, &raw, Some(0x000D /* motion sensor */))
+        let msg = parse_message(0x0500, &raw, Some(0x000D /* motion sensor */), None)
             .unwrap()
             .unwrap();
         assert_eq!(msg.values["occupancy"], true);
@@ -254,7 +273,7 @@ mod tests {
     #[test]
     fn ias_zone_status_change_defaults_to_contact() {
         let raw = [0x01, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00];
-        let msg = parse_message(0x0500, &raw, None).unwrap().unwrap();
+        let msg = parse_message(0x0500, &raw, None, None).unwrap().unwrap();
         assert_eq!(msg.values["contact"], false);
     }
 
@@ -281,16 +300,48 @@ mod tests {
             0x01, 0x01, 0x05, // cluster-specific, seq=1, cmd=Recall Scene
             0x01, 0x00, 0x05, // group=1, scene=5
         ];
-        let msg = parse_message(0x0005, &raw, None).unwrap().unwrap();
+        let msg = parse_message(0x0005, &raw, None, None).unwrap().unwrap();
         assert_eq!(msg.values["action"], "recall");
         assert_eq!(msg.values["action_scene"], 5);
     }
 
     #[test]
-    fn parse_scenes_manufacturer_specific_command() {
-        // Frame control: cluster-specific | manufacturer-specific, mfr=0x117C (IKEA)
-        let raw = [0x05, 0x7C, 0x11, 0x01, 0x07];
-        let msg = parse_message(0x0005, &raw, None).unwrap().unwrap();
-        assert_eq!(msg.values["action"], "manufacturer_0x117c_cmd_0x07");
+    fn parse_scenes_ikea_arrow_click() {
+        // Frame control: cluster-specific | manufacturer-specific, mfr=0x117C
+        // (IKEA), cmd=0x07 (ArrowSingle), value=257 (LE) -> left, value2=0
+        let raw = [0x05, 0x7C, 0x11, 0x01, 0x07, 0x01, 0x01, 0x00, 0x00];
+        let msg = parse_message(0x0005, &raw, None, None).unwrap().unwrap();
+        assert_eq!(msg.values["action"], "arrow_left_click");
+    }
+
+    #[test]
+    fn parse_scenes_ikea_arrow_hold_and_release() {
+        // ArrowHold (0x08), value=3329 (LE) -> left
+        let hold_raw = [0x05, 0x7C, 0x11, 0x01, 0x08, 0x01, 0x0D];
+        let hold_msg = parse_message(0x0005, &hold_raw, None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(hold_msg.values["action"], "arrow_left_hold");
+        assert_eq!(
+            hold_msg.arrow_hold_direction,
+            Some(Some("left".to_string()))
+        );
+
+        // ArrowRelease (0x09), value=1500 -> 1.5s, using the direction just remembered
+        let release_raw = [0x05, 0x7C, 0x11, 0x02, 0x09, 0xDC, 0x05];
+        let release_msg = parse_message(0x0005, &release_raw, None, Some("left"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(release_msg.values["action"], "arrow_left_release");
+        assert_eq!(release_msg.values["action_duration"], 1.5);
+        assert_eq!(release_msg.arrow_hold_direction, Some(None));
+    }
+
+    #[test]
+    fn parse_scenes_unmapped_manufacturer_specific_command() {
+        // A manufacturer code we don't specifically handle stays generic/honest.
+        let raw = [0x05, 0x99, 0x99, 0x01, 0x07];
+        let msg = parse_message(0x0005, &raw, None, None).unwrap().unwrap();
+        assert_eq!(msg.values["action"], "manufacturer_0x9999_cmd_0x07");
     }
 }

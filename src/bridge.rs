@@ -280,7 +280,10 @@ impl Bridge {
                             }
 
                             let zone_type = devices.get_by_nwk(src_addr).and_then(|d| d.zone_type);
-                            match zcl::parse_message(cluster_id, &data, zone_type) {
+                            let held_arrow_direction = devices
+                                .get_by_nwk(src_addr)
+                                .and_then(|d| d.arrow_hold_direction.clone());
+                            match zcl::parse_message(cluster_id, &data, zone_type, held_arrow_direction.as_deref()) {
                                 Ok(Some(mut zcl_msg)) => {
                                     if cluster_id == 0x0000 {
                                         // Basic cluster attributes (manufacturer/model/
@@ -295,11 +298,20 @@ impl Bridge {
                                         }
                                     }
                                     if let Some(mut dev) = devices.get_mut_by_nwk(src_addr) {
+                                        if let Some(direction_update) = zcl_msg.arrow_hold_direction {
+                                            dev.arrow_hold_direction = direction_update;
+                                        }
                                         dev.merge_state(zcl_msg.values.clone());
                                         dev.state.insert("linkquality".into(), json!(link_quality));
                                         dev.state.insert("last_seen".into(), json!(now_iso8601()));
                                         let state = serde_json::Value::Object(dev.state.clone());
                                         let name = dev.friendly_name.clone();
+                                        // `action`/`action_*` are momentary button-press events,
+                                        // not retained device state -- matching zigbee2mqtt,
+                                        // don't let them linger and pollute later unrelated
+                                        // publishes for this device (they're still included in
+                                        // `state`, built just above, for this one publish).
+                                        Self::strip_transient_action_fields(&mut dev.state);
                                         drop(dev);
                                         if let Err(e) = mqtt.publish_device_state(&name, &state).await {
                                             warn!("Failed to publish device state: {e}");
@@ -587,9 +599,21 @@ impl Bridge {
         }
     }
 
+    /// Remove momentary button-press fields (`action` and `action_*`) from a
+    /// device's *retained* state. Real device state (brightness, battery,
+    /// contact, ...) should keep accumulating via `merge_state`, but an
+    /// `action` is a one-off event -- without this, a stale `action` (and
+    /// its companion `action_*` keys) from one button press would linger and
+    /// get republished, mixed in, on every later unrelated event for that
+    /// device. Call this *after* building the JSON to publish for the
+    /// current message, so the action still appears in that one publish.
+    fn strip_transient_action_fields(state: &mut serde_json::Map<String, serde_json::Value>) {
+        state.retain(|k, _| k != "action" && !k.starts_with("action_"));
+    }
+
     /// Handle basic cluster (0x0000) Read Attributes Response to update device metadata.
     fn handle_basic_cluster_response(devices: &DeviceRegistry, src_addr: u16, data: &[u8]) {
-        if let Ok(Some(zcl_msg)) = zcl::parse_message(0x0000, data, None) {
+        if let Ok(Some(zcl_msg)) = zcl::parse_message(0x0000, data, None, None) {
             if let Some(mut dev) = devices.get_mut_by_nwk(src_addr) {
                 for (key, value) in &zcl_msg.values {
                     match key.as_str() {
@@ -780,6 +804,24 @@ mod tests {
         assert!(ts.contains('T'));
         assert!(ts.ends_with("+00:00"));
         assert_eq!(ts.len(), 25);
+    }
+
+    #[test]
+    fn strip_transient_action_fields_removes_only_action_keys() {
+        let mut state = serde_json::Map::new();
+        state.insert("action".into(), json!("brightness_up_click"));
+        state.insert("action_duration".into(), json!(1.5));
+        state.insert("brightness".into(), json!(200));
+        state.insert("battery".into(), json!(80));
+        state.insert("state".into(), json!("ON"));
+
+        Bridge::strip_transient_action_fields(&mut state);
+
+        assert!(!state.contains_key("action"));
+        assert!(!state.contains_key("action_duration"));
+        assert_eq!(state.get("brightness"), Some(&json!(200)));
+        assert_eq!(state.get("battery"), Some(&json!(80)));
+        assert_eq!(state.get("state"), Some(&json!("ON")));
     }
 
     #[test]

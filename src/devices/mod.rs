@@ -24,6 +24,13 @@ pub struct Device {
     /// "occupancy", "smoke", etc. -- see zigbee::zcl::clusters::ias_zone.
     #[serde(default)]
     pub zone_type: Option<u16>,
+    /// IKEA TRADFRI-style remote: the arrow direction ("left"/"right")
+    /// remembered from the most recent unreleased ArrowHold genScenes
+    /// command, if any -- consumed by the matching ArrowRelease. Internal
+    /// bookkeeping only, never published as part of device `state`. See
+    /// zigbee::zcl::clusters::scenes.
+    #[serde(default)]
+    pub arrow_hold_direction: Option<String>,
     /// Last known state values (merged from all cluster reports)
     #[serde(default)]
     pub state: serde_json::Map<String, serde_json::Value>,
@@ -45,6 +52,7 @@ impl Device {
             power_source: None,
             sw_build_id: None,
             zone_type: None,
+            arrow_hold_direction: None,
             state: serde_json::Map::new(),
             interview_complete: false,
             disabled: false,
@@ -266,7 +274,9 @@ mod tests {
         reg.rename(&test_ieee(), "kitchen_light".to_string());
 
         assert!(reg.find_by_name(&old_name).is_none());
-        let dev = reg.find_by_name("kitchen_light").expect("renamed device findable");
+        let dev = reg
+            .find_by_name("kitchen_light")
+            .expect("renamed device findable");
         assert_eq!(dev.friendly_name, "kitchen_light");
     }
 

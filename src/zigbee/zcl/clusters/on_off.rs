@@ -28,10 +28,14 @@ impl ClusterHandler for OnOffCluster {
     }
 
     fn process_command(&self, command_id: u8, _payload: &[u8]) -> Vec<(String, Value)> {
+        // These are incoming commands from a controller/remote device (a real
+        // bulb reports state via attribute reports, not by sending genOnOff
+        // commands at us), so -- matching zigbee2mqtt's convention -- they're
+        // a button-press `action`, not device `state`.
         match command_id {
-            0x00 => vec![("state".into(), json!("OFF"))],
-            0x01 => vec![("state".into(), json!("ON"))],
-            0x02 => vec![("state".into(), json!("TOGGLE"))],
+            0x00 => vec![("action".into(), json!("off"))],
+            0x01 => vec![("action".into(), json!("on"))],
+            0x02 => vec![("action".into(), json!("toggle"))],
             _ => vec![],
         }
     }
@@ -79,15 +83,15 @@ mod tests {
     fn command_on_off_toggle() {
         assert_eq!(
             OnOffCluster.process_command(0x00, &[]),
-            vec![("state".into(), json!("OFF"))]
+            vec![("action".into(), json!("off"))]
         );
         assert_eq!(
             OnOffCluster.process_command(0x01, &[]),
-            vec![("state".into(), json!("ON"))]
+            vec![("action".into(), json!("on"))]
         );
         assert_eq!(
             OnOffCluster.process_command(0x02, &[]),
-            vec![("state".into(), json!("TOGGLE"))]
+            vec![("action".into(), json!("toggle"))]
         );
     }
 

@@ -166,7 +166,9 @@ mod receive_state {
             0x29,             // Int16
             0xAB, 0xFF,       // -85 in little-endian
         ];
-        let msg = zcl::parse_message(0x0402, &raw, None).unwrap().unwrap();
+        let msg = zcl::parse_message(0x0402, &raw, None, None)
+            .unwrap()
+            .unwrap();
         let temp = msg.values["temperature"].as_f64().unwrap();
         assert!((temp - (-0.85)).abs() < 0.01);
     }
@@ -180,7 +182,9 @@ mod receive_state {
             0x00, 0x00, 0x21, // Uint16
             0xAB, 0x11,       // 4523
         ];
-        let msg = zcl::parse_message(0x0405, &raw, None).unwrap().unwrap();
+        let msg = zcl::parse_message(0x0405, &raw, None, None)
+            .unwrap()
+            .unwrap();
         let hum = msg.values["humidity"].as_f64().unwrap();
         assert!((hum - 45.23).abs() < 0.01);
     }
@@ -190,12 +194,16 @@ mod receive_state {
         // z2m: {"state": "ON"} or {"state": "OFF"}, never booleans
         #[rustfmt::skip]
         let raw_on = [0x18, 0x01, 0x0A, 0x00, 0x00, 0x10, 0x01]; // Boolean true
-        let msg = zcl::parse_message(0x0006, &raw_on, None).unwrap().unwrap();
+        let msg = zcl::parse_message(0x0006, &raw_on, None, None)
+            .unwrap()
+            .unwrap();
         assert_eq!(msg.values["state"], "ON");
 
         #[rustfmt::skip]
         let raw_off = [0x18, 0x01, 0x0A, 0x00, 0x00, 0x10, 0x00]; // Boolean false
-        let msg = zcl::parse_message(0x0006, &raw_off, None).unwrap().unwrap();
+        let msg = zcl::parse_message(0x0006, &raw_off, None, None)
+            .unwrap()
+            .unwrap();
         assert_eq!(msg.values["state"], "OFF");
     }
 
@@ -208,7 +216,9 @@ mod receive_state {
             0x00, 0x00, 0x20, // Uint8
             0xC8,             // 200
         ];
-        let msg = zcl::parse_message(0x0008, &raw, None).unwrap().unwrap();
+        let msg = zcl::parse_message(0x0008, &raw, None, None)
+            .unwrap()
+            .unwrap();
         assert_eq!(msg.values["brightness"], 200);
     }
 
@@ -221,7 +231,9 @@ mod receive_state {
             0x07, 0x00, 0x21, // attr 0x0007 = ColorTemperatureMireds, Uint16
             0x72, 0x01,       // 370
         ];
-        let msg = zcl::parse_message(0x0300, &raw, None).unwrap().unwrap();
+        let msg = zcl::parse_message(0x0300, &raw, None, None)
+            .unwrap()
+            .unwrap();
         assert_eq!(msg.values["color_temp"], 370);
     }
 
@@ -236,7 +248,9 @@ mod receive_state {
             0x04, 0x00, 0x21, // attr 0x0004 = CurrentY, Uint16
             0xCD, 0x4C,       // 19661 ≈ 0.3
         ];
-        let msg = zcl::parse_message(0x0300, &raw, None).unwrap().unwrap();
+        let msg = zcl::parse_message(0x0300, &raw, None, None)
+            .unwrap()
+            .unwrap();
         let color = msg.values.get("color").unwrap().as_object().unwrap();
         assert!(color.contains_key("x"));
         assert!(color.contains_key("y"));
@@ -253,7 +267,9 @@ mod receive_state {
             0x08, 0x00, 0x30, // attr 0x0008 = ColorMode, Enum8
             0x02,             // color_temp
         ];
-        let msg = zcl::parse_message(0x0300, &raw, None).unwrap().unwrap();
+        let msg = zcl::parse_message(0x0300, &raw, None, None)
+            .unwrap()
+            .unwrap();
         assert_eq!(msg.values["color_mode"], "color_temp");
     }
 
@@ -266,7 +282,9 @@ mod receive_state {
             0x00, 0x00, 0x18, // attr 0x0000 = Occupancy, Bitmap8
             0x01,             // occupied
         ];
-        let msg = zcl::parse_message(0x0406, &raw, None).unwrap().unwrap();
+        let msg = zcl::parse_message(0x0406, &raw, None, None)
+            .unwrap()
+            .unwrap();
         assert_eq!(msg.values["occupancy"], true);
     }
 
@@ -279,7 +297,9 @@ mod receive_state {
             0x21, 0x00, 0x20, // attr 0x0021 = BatteryPercentageRemaining, Uint8
             0xBA,             // 186 = 93%
         ];
-        let msg = zcl::parse_message(0x0001, &raw, None).unwrap().unwrap();
+        let msg = zcl::parse_message(0x0001, &raw, None, None)
+            .unwrap()
+            .unwrap();
         assert_eq!(msg.values["battery"], 93);
     }
 
@@ -293,7 +313,9 @@ mod receive_state {
             0x01, 0x00,       // zone_status = 0x0001 (ALARM1 = open)
             0x00, 0x01, 0x00, 0x00, // extended_status, zone_id, delay
         ];
-        let msg = zcl::parse_message(0x0500, &raw, None).unwrap().unwrap();
+        let msg = zcl::parse_message(0x0500, &raw, None, None)
+            .unwrap()
+            .unwrap();
         // contact=false means door is open (z2m convention)
         assert_eq!(msg.values["contact"], false);
     }
@@ -306,7 +328,9 @@ mod receive_state {
             0x00, 0x00, // zone_status = 0 (no alarm = closed)
             0x00, 0x01, 0x00, 0x00,
         ];
-        let msg = zcl::parse_message(0x0500, &raw, None).unwrap().unwrap();
+        let msg = zcl::parse_message(0x0500, &raw, None, None)
+            .unwrap()
+            .unwrap();
         assert_eq!(msg.values["contact"], true);
     }
 }
