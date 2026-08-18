@@ -202,10 +202,11 @@ impl Bridge {
 
                             // Request basic cluster attributes (manufacturer, model)
                             if input_clusters.contains(&0x0000) {
+                                trans_id = trans_id.wrapping_add(1);
                                 let payload = crate::zigbee::zcl::frame::read_attributes_payload(
+                                    trans_id,
                                     &[0x0004, 0x0005, 0x0007, 0x4000],
                                 );
-                                trans_id = trans_id.wrapping_add(1);
                                 if let Err(e) = coord.send_zcl(nwk_addr, endpoint, 0x0000, trans_id, payload).await {
                                     warn!("Failed to send ZCL read attributes: {e}");
                                 }

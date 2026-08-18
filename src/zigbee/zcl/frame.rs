@@ -77,9 +77,8 @@ pub mod global {
 }
 
 /// Build a ZCL Read Attributes request payload.
-pub fn read_attributes_payload(attr_ids: &[u16]) -> Vec<u8> {
-    let mut payload =
-        ZclFrameHeader::encode_global(0x01, global::READ_ATTRIBUTES);
+pub fn read_attributes_payload(sequence: u8, attr_ids: &[u16]) -> Vec<u8> {
+    let mut payload = ZclFrameHeader::encode_global(sequence, global::READ_ATTRIBUTES);
     for &id in attr_ids {
         payload.extend_from_slice(&id.to_le_bytes());
     }
