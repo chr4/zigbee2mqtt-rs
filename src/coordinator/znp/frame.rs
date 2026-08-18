@@ -174,22 +174,27 @@ impl Decoder for ZnpCodec {
                 return Ok(None);
             }
 
-            let frame_bytes = src[..total].to_vec();
-            src.advance(total);
+            let len_byte = src[1];
+            let cmd0 = src[2];
+            let cmd1 = src[3];
+            let data = &src[4..4 + len];
+            let received_fcs = src[4 + len];
+            let expected_fcs = compute_fcs(len_byte, cmd0, cmd1, data);
 
-            let len_byte = frame_bytes[1];
-            let cmd0 = frame_bytes[2];
-            let cmd1 = frame_bytes[3];
-            let data = frame_bytes[4..4 + len].to_vec();
-            let received_fcs = frame_bytes[4 + len];
-
-            let expected_fcs = compute_fcs(len_byte, cmd0, cmd1, &data);
             if received_fcs != expected_fcs {
                 tracing::warn!(
                     "FCS mismatch: expected 0x{expected_fcs:02X} got 0x{received_fcs:02X}, skipping"
                 );
+                // `len` may itself be corrupt, so `total` isn't trustworthy here.
+                // Advance past just this SOF byte and rescan, guaranteeing we
+                // eventually resync on the next genuine frame boundary instead
+                // of risking skipping over it.
+                src.advance(1);
                 continue;
             }
+
+            let data = data.to_vec();
+            src.advance(total);
 
             let frame_type = FrameType::from_cmd0(cmd0);
             let subsystem = Subsystem::from_cmd0(cmd0);
@@ -252,6 +257,29 @@ mod tests {
         let bytes = frame.to_bytes();
         // FCS = 0x00 ^ 0x21 ^ 0x02 = 0x23
         assert_eq!(bytes[4], 0x23);
+    }
+
+    #[test]
+    fn fcs_mismatch_resyncs_on_next_byte_not_corrupt_length() {
+        // A corrupted frame claims len=5 (total span = 10 bytes: SOF, len,
+        // cmd0, cmd1, 5 data bytes, fcs) with a wrong FCS. A real frame
+        // starts right after that 10-byte span. Trusting the claimed `total`
+        // on FCS failure (the old behavior) would advance past all 10 bytes
+        // in one jump, consuming the real frame's SOF along with it and
+        // losing it forever. Resyncing one byte at a time instead finds the
+        // real frame's SOF within that same span, before it's consumed.
+        let good = ZnpFrame::sreq(Subsystem::Sys, 0x02, vec![0xAB]);
+        let good_bytes = good.to_bytes();
+
+        let mut buf = BytesMut::new();
+        buf.put_u8(SOF);
+        buf.put_u8(5); // claimed len=5
+        buf.extend_from_slice(&[0u8; 7]); // cmd0, cmd1, 5 data bytes -- all zero, none is SOF
+        buf.put_u8(0x00); // fcs -- wrong (expected_fcs for this header is 5, not 0)
+        buf.extend_from_slice(&good_bytes);
+
+        let decoded = ZnpCodec.decode(&mut buf).unwrap().unwrap();
+        assert_eq!(decoded, good);
     }
 
     #[test]
