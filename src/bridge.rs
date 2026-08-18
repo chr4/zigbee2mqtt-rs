@@ -328,8 +328,9 @@ impl Bridge {
                 let disabled = cfg.disabled.unwrap_or(false);
 
                 if let Some(mut dev) = self.devices.get_mut_by_ieee(&ieee) {
-                    dev.friendly_name = name;
                     dev.disabled = disabled;
+                    drop(dev);
+                    self.devices.rename(&ieee, name);
                 } else {
                     // Pre-seed: create a stub device with NWK=0 (updated on join)
                     let mut dev = Device::new(ieee, 0);

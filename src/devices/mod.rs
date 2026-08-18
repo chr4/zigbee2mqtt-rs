@@ -194,6 +194,17 @@ impl DeviceRegistry {
         }
     }
 
+    /// Rename a device, keeping the `by_name` index in sync. Renaming a device
+    /// by mutating `Device::friendly_name` directly would leave a stale/missing
+    /// `by_name` entry, breaking MQTT set/get lookups for the new name.
+    pub fn rename(&self, ieee: &IeeeAddr, new_name: String) {
+        if let Some(mut dev) = self.by_ieee.get_mut(ieee) {
+            self.by_name.remove(&dev.friendly_name);
+            dev.friendly_name = new_name.clone();
+            self.by_name.insert(new_name, *ieee);
+        }
+    }
+
     #[must_use]
     pub fn all_devices(&self) -> Vec<Device> {
         self.by_ieee.iter().map(|r| r.value().clone()).collect()
@@ -237,6 +248,20 @@ mod tests {
 
         assert!(reg.get_by_nwk(0x1234).is_none());
         assert!(reg.get_by_nwk(0x5678).is_some());
+    }
+
+    #[test]
+    fn rename_updates_by_name_index() {
+        let reg = DeviceRegistry::new();
+        reg.add(Device::new(test_ieee(), 0x1234));
+        // Default friendly_name is the IEEE hex string.
+        let old_name = test_ieee().as_hex();
+
+        reg.rename(&test_ieee(), "kitchen_light".to_string());
+
+        assert!(reg.find_by_name(&old_name).is_none());
+        let dev = reg.find_by_name("kitchen_light").expect("renamed device findable");
+        assert_eq!(dev.friendly_name, "kitchen_light");
     }
 
     #[test]
