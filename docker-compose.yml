@@ -1,0 +1,20 @@
+services:
+  dev:
+    build: .
+    volumes:
+      # Mount source code, make devcontainer files read-only
+      - .:/src
+      - ./Dockerfile:/src/Dockerfile:ro
+      - ./docker-compose.yml:/src/docker-compose.yml:ro
+
+      # Persist claude configuration in external volume (shared by all Claude containers)
+      - claude_state:/home/agent/.claude-state
+
+      # Hide sensitive files
+      - /dev/null:/src/.envrc:ro
+    working_dir: /src
+    stdin_open: true
+    tty: true
+
+volumes:
+  claude_state:
