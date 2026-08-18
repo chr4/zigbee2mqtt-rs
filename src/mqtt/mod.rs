@@ -193,11 +193,7 @@ async fn run_event_loop(
                 if topic.ends_with("/set") || topic.ends_with("/get") {
                     let is_set = topic.ends_with("/set");
                     let suffix = if is_set { "/set" } else { "/get" };
-                    let name = topic
-                        .trim_start_matches(base_topic)
-                        .trim_start_matches('/')
-                        .trim_end_matches(suffix)
-                        .to_string();
+                    let name = friendly_name_from_topic(topic, base_topic, suffix);
 
                     let json_value = serde_json::from_slice::<serde_json::Value>(payload)
                         .unwrap_or_else(|_| {
@@ -248,6 +244,19 @@ async fn run_event_loop(
 /// Double the reconnect delay, capped at MQTT_RECONNECT_DELAY_MAX.
 fn next_backoff(current: Duration) -> Duration {
     (current * 2).min(MQTT_RECONNECT_DELAY_MAX)
+}
+
+/// Extract the friendly name from a "{base_topic}/{friendly_name}/{suffix}" topic.
+/// Subscriptions are always "{base_topic}/+/set" or ".../get", so this always
+/// matches for topics reaching this function; falls back to the raw topic on
+/// any unexpected shape.
+fn friendly_name_from_topic(topic: &str, base_topic: &str, suffix: &str) -> String {
+    topic
+        .strip_prefix(base_topic)
+        .and_then(|s| s.strip_prefix('/'))
+        .and_then(|s| s.strip_suffix(suffix))
+        .unwrap_or(topic)
+        .to_string()
 }
 
 async fn subscribe_topics(client: &AsyncClient, base_topic: &str) -> bool {
@@ -342,6 +351,31 @@ mod tests {
         assert_eq!(
             next_backoff(MQTT_RECONNECT_DELAY_MIN),
             MQTT_RECONNECT_DELAY_MIN * 2
+        );
+    }
+
+    #[test]
+    fn friendly_name_from_set_topic() {
+        assert_eq!(
+            friendly_name_from_topic("zigbee2mqtt/kitchen_light/set", "zigbee2mqtt", "/set"),
+            "kitchen_light"
+        );
+    }
+
+    #[test]
+    fn friendly_name_from_get_topic() {
+        assert_eq!(
+            friendly_name_from_topic("zigbee2mqtt/kitchen_light/get", "zigbee2mqtt", "/get"),
+            "kitchen_light"
+        );
+    }
+
+    #[test]
+    fn friendly_name_with_nested_path() {
+        // z2m allows friendly names containing '/' (e.g. "room/light")
+        assert_eq!(
+            friendly_name_from_topic("zigbee2mqtt/room/light/set", "zigbee2mqtt", "/set"),
+            "room/light"
         );
     }
 }
