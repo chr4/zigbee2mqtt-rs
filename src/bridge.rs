@@ -160,7 +160,7 @@ impl Bridge {
                             }
 
                             // Trigger interview if not done yet
-                            if devices.get_by_ieee(&ieee).map_or(false, |d| !d.interview_complete) {
+                            if devices.get_by_ieee(&ieee).is_some_and(|d| !d.interview_complete) {
                                 if let Err(e) = coord.request_active_eps(nwk_addr).await {
                                     warn!("Failed to request active endpoints: {e}");
                                 }

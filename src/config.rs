@@ -4,7 +4,7 @@ use std::path::Path;
 
 use crate::error::{Error, Result};
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
     pub serial: SerialConfig,
@@ -91,19 +91,6 @@ impl std::fmt::Debug for AdvancedConfig {
             .field("report_state_interval", &self.report_state_interval)
             .field("cache_state", &self.cache_state)
             .finish()
-    }
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            serial: SerialConfig::default(),
-            mqtt: MqttConfig::default(),
-            permit_join: false,
-            homeassistant: false,
-            devices: HashMap::new(),
-            advanced: AdvancedConfig::default(),
-        }
     }
 }
 

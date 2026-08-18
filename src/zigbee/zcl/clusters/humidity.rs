@@ -16,7 +16,8 @@ impl ClusterHandler for HumidityCluster {
             if r.attr_id == MEASURED_VALUE {
                 if let Some(v) = r.value.as_f64() {
                     if v < 10_001.0 {
-                        let humidity = (v / 100.0 * 100.0).round() / 100.0;
+                        // MeasuredValue is in units of 0.01%.
+                        let humidity = v.round() / 100.0;
                         out.push(("humidity".into(), json!(humidity)));
                     }
                 }

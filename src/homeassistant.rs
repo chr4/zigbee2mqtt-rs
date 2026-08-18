@@ -66,68 +66,33 @@ pub async fn publish_discovery(
         }
     }
 
+    let sensor_ctx = SensorDiscoveryCtx {
+        mqtt,
+        device,
+        base_topic,
+        ieee_hex: &ieee_hex,
+        ha_device: &ha_device,
+        availability: &availability,
+    };
+
     // ── Temperature sensor ────────────────────────────────────────────────
     if clusters.contains(&0x0402) {
-        publish_sensor(
-            mqtt,
-            device,
-            base_topic,
-            &ieee_hex,
-            "temperature",
-            "temperature",
-            "°C",
-            &ha_device,
-            &availability,
-        )
-        .await;
+        publish_sensor(&sensor_ctx, "temperature", "°C").await;
     }
 
     // ── Humidity sensor ───────────────────────────────────────────────────
     if clusters.contains(&0x0405) {
-        publish_sensor(
-            mqtt,
-            device,
-            base_topic,
-            &ieee_hex,
-            "humidity",
-            "humidity",
-            "%",
-            &ha_device,
-            &availability,
-        )
-        .await;
+        publish_sensor(&sensor_ctx, "humidity", "%").await;
     }
 
     // ── Illuminance sensor ────────────────────────────────────────────────
     if clusters.contains(&0x0400) {
-        publish_sensor(
-            mqtt,
-            device,
-            base_topic,
-            &ieee_hex,
-            "illuminance",
-            "illuminance",
-            "lx",
-            &ha_device,
-            &availability,
-        )
-        .await;
+        publish_sensor(&sensor_ctx, "illuminance", "lx").await;
     }
 
     // ── Battery sensor ────────────────────────────────────────────────────
     if clusters.contains(&0x0001) {
-        publish_sensor(
-            mqtt,
-            device,
-            base_topic,
-            &ieee_hex,
-            "battery",
-            "battery",
-            "%",
-            &ha_device,
-            &availability,
-        )
-        .await;
+        publish_sensor(&sensor_ctx, "battery", "%").await;
     }
 
     // ── Occupancy binary sensor ───────────────────────────────────────────
@@ -183,17 +148,20 @@ pub async fn publish_discovery(
     }
 }
 
-async fn publish_sensor(
-    mqtt: &MqttBridge,
-    device: &Device,
-    base_topic: &str,
-    ieee_hex: &str,
-    value_key: &str,
-    device_class: &str,
-    unit: &str,
-    ha_device: &Value,
-    availability: &Value,
-) {
+/// Shared context for the numeric-sensor discovery configs below (temperature,
+/// humidity, illuminance, battery), which otherwise differ only in the
+/// device_class/unit_of_measurement pair.
+struct SensorDiscoveryCtx<'a> {
+    mqtt: &'a MqttBridge,
+    device: &'a Device,
+    base_topic: &'a str,
+    ieee_hex: &'a str,
+    ha_device: &'a Value,
+    availability: &'a Value,
+}
+
+async fn publish_sensor(ctx: &SensorDiscoveryCtx<'_>, device_class: &str, unit: &str) {
+    let SensorDiscoveryCtx { mqtt, device, base_topic, ieee_hex, ha_device, availability } = *ctx;
     let config = json!({
         "availability": availability,
         "state_topic": format!("{}/{}", base_topic, device.friendly_name),
@@ -203,7 +171,7 @@ async fn publish_sensor(
         "device_class": device_class,
         "unit_of_measurement": unit,
         "state_class": "measurement",
-        "value_template": format!("{{{{ value_json.{value_key} }}}}"),
+        "value_template": format!("{{{{ value_json.{device_class} }}}}"),
         "enabled_by_default": true,
     });
     publish(mqtt, "sensor", ieee_hex, device_class, &config).await;

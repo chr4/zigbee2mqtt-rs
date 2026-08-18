@@ -169,7 +169,7 @@ impl DeviceRegistry {
         &self,
         addr: NwkAddr,
     ) -> Option<dashmap::mapref::one::RefMut<'_, IeeeAddr, Device>> {
-        let ieee = self.by_nwk.get(&addr)?.value().clone();
+        let ieee = *self.by_nwk.get(&addr)?.value();
         self.by_ieee.get_mut(&ieee)
     }
 
