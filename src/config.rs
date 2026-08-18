@@ -32,7 +32,7 @@ pub enum AdapterType {
     Auto,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct MqttConfig {
     pub server: String,
@@ -45,6 +45,21 @@ pub struct MqttConfig {
     pub reject_unauthorized: bool,
 }
 
+impl std::fmt::Debug for MqttConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MqttConfig")
+            .field("server", &self.server)
+            .field("port", &self.port)
+            .field("base_topic", &self.base_topic)
+            .field("client_id", &self.client_id)
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("keepalive", &self.keepalive)
+            .field("reject_unauthorized", &self.reject_unauthorized)
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct DeviceConfig {
     pub friendly_name: Option<String>,
@@ -53,7 +68,7 @@ pub struct DeviceConfig {
     pub disabled: Option<bool>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct AdvancedConfig {
     pub pan_id: u16,
@@ -63,6 +78,20 @@ pub struct AdvancedConfig {
     pub log_level: String,
     pub report_state_interval: u64,
     pub cache_state: bool,
+}
+
+impl std::fmt::Debug for AdvancedConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdvancedConfig")
+            .field("pan_id", &self.pan_id)
+            .field("ext_pan_id", &self.ext_pan_id)
+            .field("channel", &self.channel)
+            .field("network_key", &"<redacted>")
+            .field("log_level", &self.log_level)
+            .field("report_state_interval", &self.report_state_interval)
+            .field("cache_state", &self.cache_state)
+            .finish()
+    }
 }
 
 impl Default for Config {
@@ -135,5 +164,30 @@ impl Config {
             )));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mqtt_config_debug_redacts_password() {
+        let cfg = MqttConfig {
+            password: Some("hunter2".to_string()),
+            ..MqttConfig::default()
+        };
+        let debug = format!("{cfg:?}");
+        assert!(!debug.contains("hunter2"));
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn advanced_config_debug_redacts_network_key() {
+        let cfg = AdvancedConfig::default();
+        let debug = format!("{cfg:?}");
+        let raw_key_debug = format!("{:?}", cfg.network_key);
+        assert!(!debug.contains(&raw_key_debug));
+        assert!(debug.contains("<redacted>"));
     }
 }
