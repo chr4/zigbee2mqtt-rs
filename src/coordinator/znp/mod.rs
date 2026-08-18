@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::{mpsc, Mutex};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use commands::*;
 use transport::{ZnpEvent, ZnpTransport};
@@ -34,6 +34,12 @@ impl ZnpCoordinator {
     pub async fn start(mut self, cfg: &Config) -> Result<CoordinatorHandle> {
         self.reset().await?;
         let version = self.check_version().await?;
+        // Unverified heuristic, not sourced from a TI spec we have on hand:
+        // product_id 0 is assumed to mean Z-Stack Home 1.2 (CC2531) and >=1
+        // Z-Stack 3.x (CC2652/CC1352). If this misdetects, BDB channel
+        // configuration below is silently skipped or wrongly applied -- if
+        // joins fail on a given adapter, check the "ZNP version:" log line
+        // logged just above against that adapter's actual stack version.
         let is_zstack3 = version.product_id >= 1;
         self.write_nv_config(cfg).await?;
         if is_zstack3 {
@@ -145,8 +151,8 @@ impl ZnpCoordinator {
             .request(sys_osal_nv_write(item_id, data))
             .await?;
         if rsp.data.first().copied() != Some(0) {
-            debug!(
-                "NV write 0x{item_id:04X} returned status {:?}",
+            warn!(
+                "NV write 0x{item_id:04X} returned non-zero status {:?}",
                 rsp.data.first()
             );
         }
@@ -163,7 +169,7 @@ impl ZnpCoordinator {
             .request(app_cnf_bdb_set_channel(channel_mask, true))
             .await?;
         if rsp.data.first().copied() != Some(0) {
-            debug!("BDB set primary channel returned: {:?}", rsp.data);
+            warn!("BDB set primary channel returned non-zero status: {:?}", rsp.data);
         }
 
         // Clear secondary channel
@@ -172,7 +178,7 @@ impl ZnpCoordinator {
             .request(app_cnf_bdb_set_channel(0, false))
             .await?;
         if rsp.data.first().copied() != Some(0) {
-            debug!("BDB set secondary channel returned: {:?}", rsp.data);
+            warn!("BDB set secondary channel returned non-zero status: {:?}", rsp.data);
         }
 
         info!("Zigbee channel set to {channel}");
