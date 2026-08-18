@@ -12,7 +12,7 @@ pub enum Error {
     Mqtt(#[from] rumqttc::ClientError),
 
     #[error("MQTT connection error: {0}")]
-    MqttConnection(#[from] rumqttc::ConnectionError),
+    MqttConnection(Box<rumqttc::ConnectionError>),
 
     #[error("Serialization error: {0}")]
     Serde(#[from] serde_json::Error),
@@ -34,6 +34,12 @@ pub enum Error {
 
     #[error("Configuration error: {0}")]
     Config(String),
+}
+
+impl From<rumqttc::ConnectionError> for Error {
+    fn from(e: rumqttc::ConnectionError) -> Self {
+        Error::MqttConnection(Box::new(e))
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
