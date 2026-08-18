@@ -89,6 +89,7 @@ pub enum AttributeValue {
     U32(u32),
     I8(i8),
     I16(i16),
+    I24(i32),
     I32(i32),
     Float(f32),
     Str(String),
@@ -119,6 +120,13 @@ impl AttributeValue {
                 if buf.len() < 3 { return Err(Error::Zcl("truncated u24".into())); }
                 let v = u32::from_le_bytes([buf[0], buf[1], buf[2], 0]);
                 Ok((Self::U24(v), 3))
+            }
+            DataType::Int24 => {
+                if buf.len() < 3 { return Err(Error::Zcl("truncated i24".into())); }
+                // Sign-extend the 24-bit value from its high bit before widening to i32.
+                let sign_ext = if buf[2] & 0x80 != 0 { 0xFF } else { 0x00 };
+                let v = i32::from_le_bytes([buf[0], buf[1], buf[2], sign_ext]);
+                Ok((Self::I24(v), 3))
             }
             DataType::Uint32 | DataType::Data32 => {
                 if buf.len() < 4 { return Err(Error::Zcl("truncated u32".into())); }
@@ -151,6 +159,20 @@ impl AttributeValue {
                 if buf.len() < 1 + len { return Err(Error::Zcl("truncated octet string".into())); }
                 Ok((Self::Bytes, 1 + len))
             }
+            DataType::LongCharStr => {
+                if buf.len() < 2 { return Err(Error::Zcl("missing long string length".into())); }
+                let len = u16::from_le_bytes([buf[0], buf[1]]) as usize;
+                if len == 0xFFFF { return Ok((Self::Invalid, 2)); } // invalid value
+                if buf.len() < 2 + len { return Err(Error::Zcl("truncated long string".into())); }
+                let s = String::from_utf8_lossy(&buf[2..2 + len]).into_owned();
+                Ok((Self::Str(s), 2 + len))
+            }
+            DataType::LongOctetStr => {
+                if buf.len() < 2 { return Err(Error::Zcl("missing long octet-string length".into())); }
+                let len = u16::from_le_bytes([buf[0], buf[1]]) as usize;
+                if buf.len() < 2 + len { return Err(Error::Zcl("truncated long octet string".into())); }
+                Ok((Self::Bytes, 2 + len))
+            }
             DataType::NoData => Ok((Self::Invalid, 0)),
             _ => {
                 // Unknown type — skip based on fixed length if available
@@ -171,6 +193,7 @@ impl AttributeValue {
             Self::U32(v) => Some(*v as f64),
             Self::I8(v)  => Some(*v as f64),
             Self::I16(v) => Some(*v as f64),
+            Self::I24(v) => Some(*v as f64),
             Self::I32(v) => Some(*v as f64),
             Self::Float(v) => Some(*v as f64),
             Self::Bool(v)  => Some(if *v { 1.0 } else { 0.0 }),
@@ -291,6 +314,47 @@ mod tests {
         let (val, consumed) = AttributeValue::parse(DataType::Uint24, &[0x01, 0x02, 0x03]).unwrap();
         assert_eq!(consumed, 3);
         assert_eq!(val.as_f64(), Some(0x030201 as f64));
+    }
+
+    #[test]
+    fn parse_i24_positive() {
+        let (val, consumed) = AttributeValue::parse(DataType::Int24, &[0x01, 0x02, 0x03]).unwrap();
+        assert_eq!(consumed, 3);
+        assert_eq!(val.as_f64(), Some(0x030201 as f64));
+    }
+
+    #[test]
+    fn parse_i24_negative() {
+        // -1 as a 24-bit two's-complement value: 0xFFFFFF
+        let (val, consumed) = AttributeValue::parse(DataType::Int24, &[0xFF, 0xFF, 0xFF]).unwrap();
+        assert_eq!(consumed, 3);
+        assert_eq!(val.as_f64(), Some(-1.0));
+    }
+
+    #[test]
+    fn parse_long_char_str() {
+        let buf = [5, 0, b'H', b'e', b'l', b'l', b'o'];
+        let (val, consumed) = AttributeValue::parse(DataType::LongCharStr, &buf).unwrap();
+        assert_eq!(consumed, 7);
+        if let AttributeValue::Str(s) = val {
+            assert_eq!(s, "Hello");
+        } else {
+            panic!("Expected Str");
+        }
+    }
+
+    #[test]
+    fn parse_long_char_str_invalid_length() {
+        let (val, consumed) = AttributeValue::parse(DataType::LongCharStr, &[0xFF, 0xFF]).unwrap();
+        assert_eq!(consumed, 2);
+        assert!(matches!(val, AttributeValue::Invalid));
+    }
+
+    #[test]
+    fn parse_long_octet_str() {
+        let buf = [3, 0, 0xAA, 0xBB, 0xCC];
+        let (_, consumed) = AttributeValue::parse(DataType::LongOctetStr, &buf).unwrap();
+        assert_eq!(consumed, 5);
     }
 
     #[test]
