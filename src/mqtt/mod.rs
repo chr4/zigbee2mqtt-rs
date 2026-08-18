@@ -10,7 +10,8 @@ use tracing::{error, info, warn};
 use crate::config::MqttConfig;
 use crate::error::{Error, Result};
 
-const MQTT_RECONNECT_DELAY: Duration = Duration::from_secs(1);
+const MQTT_RECONNECT_DELAY_MIN: Duration = Duration::from_secs(1);
+const MQTT_RECONNECT_DELAY_MAX: Duration = Duration::from_secs(30);
 
 // ── Inbound MQTT commands ─────────────────────────────────────────────────────
 
@@ -167,10 +168,12 @@ async fn run_event_loop(
 ) {
     let mut connected_once = false;
     let mut connected_tx = Some(connected_tx);
+    let mut reconnect_delay = MQTT_RECONNECT_DELAY_MIN;
 
     loop {
         match event_loop.poll().await {
             Ok(Event::Incoming(Packet::ConnAck(_))) => {
+                reconnect_delay = MQTT_RECONNECT_DELAY_MIN;
                 if subscribe_topics(&client, base_topic).await {
                     if connected_once {
                         let _ = cmd_tx.send(MqttCommand::Connected).await;
@@ -224,20 +227,27 @@ async fn run_event_loop(
             Ok(Event::Incoming(Packet::Disconnect)) => {
                 warn!(
                     "MQTT disconnected, retrying in {}s",
-                    MQTT_RECONNECT_DELAY.as_secs()
+                    reconnect_delay.as_secs()
                 );
-                tokio::time::sleep(MQTT_RECONNECT_DELAY).await;
+                tokio::time::sleep(reconnect_delay).await;
+                reconnect_delay = next_backoff(reconnect_delay);
             }
             Ok(_) => {}
             Err(e) => {
                 error!(
                     "MQTT event loop error: {e}; retrying in {}s",
-                    MQTT_RECONNECT_DELAY.as_secs()
+                    reconnect_delay.as_secs()
                 );
-                tokio::time::sleep(MQTT_RECONNECT_DELAY).await;
+                tokio::time::sleep(reconnect_delay).await;
+                reconnect_delay = next_backoff(reconnect_delay);
             }
         }
     }
+}
+
+/// Double the reconnect delay, capped at MQTT_RECONNECT_DELAY_MAX.
+fn next_backoff(current: Duration) -> Duration {
+    (current * 2).min(MQTT_RECONNECT_DELAY_MAX)
 }
 
 async fn subscribe_topics(client: &AsyncClient, base_topic: &str) -> bool {
@@ -316,5 +326,22 @@ mod tests {
     #[test]
     fn parse_permit_join_garbage_fails_closed() {
         assert_eq!(parse_permit_join_payload(b"not a number or json"), 0);
+    }
+
+    #[test]
+    fn backoff_doubles_and_caps() {
+        let mut delay = MQTT_RECONNECT_DELAY_MIN;
+        for _ in 0..10 {
+            delay = next_backoff(delay);
+        }
+        assert_eq!(delay, MQTT_RECONNECT_DELAY_MAX);
+    }
+
+    #[test]
+    fn backoff_starts_at_double_the_min() {
+        assert_eq!(
+            next_backoff(MQTT_RECONNECT_DELAY_MIN),
+            MQTT_RECONNECT_DELAY_MIN * 2
+        );
     }
 }
