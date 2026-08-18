@@ -150,6 +150,15 @@ impl Config {
                 self.advanced.channel
             )));
         }
+        if self.serial.port.trim().is_empty() {
+            return Err(Error::Config("serial.port must not be empty".to_string()));
+        }
+        if self.mqtt.server.trim().is_empty() {
+            return Err(Error::Config("mqtt.server must not be empty".to_string()));
+        }
+        if self.mqtt.base_topic.trim().is_empty() {
+            return Err(Error::Config("mqtt.base_topic must not be empty".to_string()));
+        }
         Ok(())
     }
 }
@@ -176,5 +185,38 @@ mod tests {
         let raw_key_debug = format!("{:?}", cfg.network_key);
         assert!(!debug.contains(&raw_key_debug));
         assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn validate_accepts_defaults() {
+        assert!(Config::default().validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_channel_out_of_range() {
+        let mut cfg = Config::default();
+        cfg.advanced.channel = 30;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_empty_serial_port() {
+        let mut cfg = Config::default();
+        cfg.serial.port = "  ".to_string();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_empty_mqtt_server() {
+        let mut cfg = Config::default();
+        cfg.mqtt.server = String::new();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_empty_base_topic() {
+        let mut cfg = Config::default();
+        cfg.mqtt.base_topic = String::new();
+        assert!(cfg.validate().is_err());
     }
 }
