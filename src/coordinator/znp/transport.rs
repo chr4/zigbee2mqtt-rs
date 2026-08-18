@@ -6,6 +6,8 @@
 ///
 /// SREQ/SRSP pairing is handled internally: `request()` sends an SREQ and
 /// waits for the matching SRSP (same cmd0 subsystem bits + cmd1).
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures::SinkExt;
@@ -42,8 +44,14 @@ enum ActorMsg {
     Send(ZnpFrame),
     Request {
         frame:      ZnpFrame,
+        id:         u64,
         reply_tx:   oneshot::Sender<Result<ZnpFrame>>,
     },
+    /// Sent by the client when a request's timeout elapses, so the actor can
+    /// drop a stale `pending` entry instead of risking it being matched
+    /// against a later request of the same (subsystem, cmd1) shape -- the
+    /// ZNP wire format carries no request ID we could match on directly.
+    Cancel(u64),
 }
 
 // ── Actor task ────────────────────────────────────────────────────────────────
@@ -52,7 +60,14 @@ struct TransportActor {
     framed:     Framed<tokio_serial::SerialStream, ZnpCodec>,
     actor_rx:   mpsc::Receiver<ActorMsg>,
     event_tx:   mpsc::Sender<ZnpEvent>,
-    pending:    Option<(u8, u8, oneshot::Sender<Result<ZnpFrame>>)>, // (cmd0_sub, cmd1, tx)
+    pending:    Option<PendingRequest>,
+}
+
+struct PendingRequest {
+    id: u64,
+    expected_sub: u8,
+    expected_cmd1: u8,
+    reply_tx: oneshot::Sender<Result<ZnpFrame>>,
 }
 
 impl TransportActor {
@@ -69,7 +84,7 @@ impl TransportActor {
                                 error!("ZNP serial write error: {e}");
                             }
                         }
-                        Some(ActorMsg::Request { frame, reply_tx }) => {
+                        Some(ActorMsg::Request { frame, id, reply_tx }) => {
                             let expected_cmd0 = frame.cmd0();
                             let cmd1          = frame.cmd1;
                             trace!(?frame, "→ ZNP send SREQ");
@@ -77,7 +92,17 @@ impl TransportActor {
                                 let _ = reply_tx.send(Err(Error::Io(e)));
                                 continue;
                             }
-                            self.pending = Some((expected_cmd0 & 0x1F, cmd1, reply_tx));
+                            self.pending = Some(PendingRequest {
+                                id,
+                                expected_sub: expected_cmd0 & 0x1F,
+                                expected_cmd1: cmd1,
+                                reply_tx,
+                            });
+                        }
+                        Some(ActorMsg::Cancel(id)) => {
+                            if self.pending.as_ref().is_some_and(|p| p.id == id) {
+                                self.pending = None;
+                            }
                         }
                     }
                 }
@@ -105,21 +130,21 @@ impl TransportActor {
         trace!(?frame, "← ZNP recv");
 
         if frame.frame_type == FrameType::SRsp {
-            if let Some((expected_sub, expected_cmd1, _)) = &self.pending {
-                if frame.subsystem as u8 == *expected_sub && frame.cmd1 == *expected_cmd1 {
-                    let (_, _, reply_tx) = self.pending.take().unwrap();
-                    let _ = reply_tx.send(Ok(frame));
+            if let Some(pending) = &self.pending {
+                if frame.subsystem as u8 == pending.expected_sub && frame.cmd1 == pending.expected_cmd1 {
+                    let pending = self.pending.take().unwrap();
+                    let _ = pending.reply_tx.send(Ok(frame));
                     return;
                 }
                 // Mismatched subsystem but there's a pending request — deliver it
                 // anyway. Z-Stack 1.2 may return subsystem 0 for errors.
-                if frame.cmd1 == *expected_cmd1 {
+                if frame.cmd1 == pending.expected_cmd1 {
                     warn!(
                         "SRSP subsystem mismatch: expected 0x{:02X} got 0x{:02X}, delivering anyway",
-                        expected_sub, frame.subsystem as u8
+                        pending.expected_sub, frame.subsystem as u8
                     );
-                    let (_, _, reply_tx) = self.pending.take().unwrap();
-                    let _ = reply_tx.send(Ok(frame));
+                    let pending = self.pending.take().unwrap();
+                    let _ = pending.reply_tx.send(Ok(frame));
                     return;
                 }
             }
@@ -155,6 +180,7 @@ impl TransportActor {
 #[derive(Clone)]
 pub struct ZnpTransport {
     actor_tx: mpsc::Sender<ActorMsg>,
+    next_id: Arc<AtomicU64>,
 }
 
 impl ZnpTransport {
@@ -171,7 +197,7 @@ impl ZnpTransport {
         let actor = TransportActor { framed, actor_rx, event_tx, pending: None };
         tokio::spawn(actor.run());
 
-        Ok((Self { actor_tx }, event_rx))
+        Ok((Self { actor_tx, next_id: Arc::new(AtomicU64::new(0)) }, event_rx))
     }
 
     /// Fire-and-forget AREQ send.
@@ -184,15 +210,22 @@ impl ZnpTransport {
 
     /// Send SREQ and wait for matching SRSP.
     pub async fn request(&self, frame: ZnpFrame) -> Result<ZnpFrame> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (reply_tx, reply_rx) = oneshot::channel();
         self.actor_tx
-            .send(ActorMsg::Request { frame, reply_tx })
+            .send(ActorMsg::Request { frame, id, reply_tx })
             .await
             .map_err(|_| Error::ChannelClosed)?;
 
-        tokio::time::timeout(REQUEST_TIMEOUT, reply_rx)
-            .await
-            .map_err(|_| Error::Timeout)?
-            .map_err(|_| Error::ChannelClosed)?
+        match tokio::time::timeout(REQUEST_TIMEOUT, reply_rx).await {
+            Ok(result) => result.map_err(|_| Error::ChannelClosed)?,
+            Err(_) => {
+                // Tell the actor to drop `pending` if it's still ours, so a
+                // late SRSP that finally arrives isn't misdelivered to
+                // whichever request comes next with the same (subsystem, cmd1).
+                let _ = self.actor_tx.send(ActorMsg::Cancel(id)).await;
+                Err(Error::Timeout)
+            }
+        }
     }
 }
