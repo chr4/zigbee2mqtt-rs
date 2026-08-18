@@ -240,7 +240,19 @@ impl Bridge {
                             }
 
                             match zcl::parse_message(cluster_id, &data) {
-                                Ok(Some(zcl_msg)) => {
+                                Ok(Some(mut zcl_msg)) => {
+                                    if cluster_id == 0x0000 {
+                                        // Basic cluster attributes (manufacturer/model/
+                                        // power_source/sw_build_id) are device metadata, not
+                                        // volatile state -- z2m doesn't publish them on the
+                                        // device state topic. handle_basic_cluster_response()
+                                        // above already routed them onto dedicated Device
+                                        // fields; strip them here so they aren't also merged
+                                        // into (and published as part of) device state.
+                                        for key in BASIC_CLUSTER_METADATA_KEYS {
+                                            zcl_msg.values.remove(key);
+                                        }
+                                    }
                                     if let Some(mut dev) = devices.get_mut_by_nwk(src_addr) {
                                         dev.merge_state(zcl_msg.values.clone());
                                         dev.state.insert("linkquality".into(), json!(link_quality));
@@ -600,6 +612,11 @@ impl Bridge {
         }
     }
 }
+
+/// Keys BasicCluster::process_reports emits, mirroring the dedicated Device
+/// fields handle_basic_cluster_response() populates from the same data.
+const BASIC_CLUSTER_METADATA_KEYS: [&str; 4] =
+    ["manufacturer", "model", "power_source", "sw_build_id"];
 
 fn find_ep_with_cluster(endpoints: &[EndpointDesc], cluster_id: u16) -> Option<u8> {
     endpoints
