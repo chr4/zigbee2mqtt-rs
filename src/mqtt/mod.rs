@@ -273,11 +273,12 @@ fn parse_permit_join_payload(payload: &[u8]) -> u8 {
             }
         }
     }
-    // Plain number
+    // Plain number. Fail closed (no join) on anything unparseable, rather than
+    // enabling pairing for the max duration on a garbage/unexpected payload.
     std::str::from_utf8(payload)
         .ok()
         .and_then(|s| s.trim().parse::<u8>().ok())
-        .unwrap_or(254)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -308,7 +309,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_permit_join_empty() {
-        assert_eq!(parse_permit_join_payload(b""), 254);
+    fn parse_permit_join_empty_fails_closed() {
+        assert_eq!(parse_permit_join_payload(b""), 0);
+    }
+
+    #[test]
+    fn parse_permit_join_garbage_fails_closed() {
+        assert_eq!(parse_permit_join_payload(b"not a number or json"), 0);
     }
 }
