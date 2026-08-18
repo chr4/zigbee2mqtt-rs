@@ -40,6 +40,108 @@ cargo build --release --target aarch64-unknown-linux-gnu
 # Binary at: target/aarch64-unknown-linux-gnu/release/zigbee2mqtt-rs
 ```
 
+## Nix / NixOS
+
+The repo ships a flake (`flake.nix`), a standalone `default.nix`, and a NixOS
+module (`nixos/module.nix`) -- no manual cross-compiler setup required.
+
+### Building with Nix
+
+```bash
+# Native build for your current system
+nix build .#zigbee2mqtt-rs
+
+# Cross-compiled aarch64 binary (Raspberry Pi 3), built via real Rust cross-
+# compilation -- no QEMU emulation needed
+nix build .#aarch64
+# Binary at: result/bin/zigbee2mqtt-rs
+
+# Without flakes (nix-command/flakes experimental features disabled):
+nix-build default.nix
+
+# Dev shell with Rust toolchain, rust-analyzer, cargo-watch, mosquitto
+# CLI tools, and minicom preinstalled
+nix develop
+```
+
+### Installing as a NixOS service
+
+Add this repo as a flake input and import its module:
+
+```nix
+{
+  inputs.zigbee2mqtt-rs.url = "github:chr4/zigbee2mqtt-rs";
+  # For a private fork: "git+ssh://git@github.com/<you>/zigbee2mqtt-rs.git"
+
+  outputs = { self, nixpkgs, zigbee2mqtt-rs, ... }: {
+    nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux"; # or "aarch64-linux" on a Pi
+      modules = [
+        zigbee2mqtt-rs.nixosModules.default
+        {
+          services.zigbee2mqtt-rs = {
+            enable = true;
+            settings = {
+              serial.port = "/dev/ttyACM0";
+              mqtt.server = "localhost";
+              permit_join = false;
+            };
+          };
+        }
+      ];
+    };
+  };
+}
+```
+
+Available `services.zigbee2mqtt-rs` options:
+
+| Option | Default | Description |
+|---|---|---|
+| `enable` | `false` | Enable the service |
+| `package` | flake's native build | Package providing the binary |
+| `dataDir` | `/var/lib/zigbee2mqtt-rs` | Runtime state directory |
+| `user` / `group` | `zigbee2mqtt-rs` | Service account |
+| `settings.serial.port` | `/dev/ttyACM0` | Zigbee adapter serial port |
+| `settings.serial.baudrate` | `115200` | Serial baud rate |
+| `settings.serial.adapter` | `znp` | `znp`, `ezsp`, or `auto` |
+| `settings.mqtt.server` | `localhost` | MQTT broker host |
+| `settings.mqtt.port` | `1883` | MQTT broker port |
+| `settings.mqtt.base_topic` | `zigbee2mqtt` | MQTT topic prefix |
+| `settings.permit_join` | `false` | Allow new devices to join on startup |
+| `settings.advanced.channel` | `11` | Zigbee RF channel (11-26) |
+| `settings.advanced.log_level` | `info` | `trace`, `debug`, `info`, `warn`, `error` |
+
+`settings` accepts any other key from the [Configuration](#configuration)
+section too (it's a free-form YAML passthrough on top of the typed options
+above). The service runs hardened by default (`ProtectSystem = "strict"`,
+locked-down syscall filter, no new privileges) and creates a udev rule
+granting the `dialout` group access to common Zigbee USB adapters (Texas
+Instruments CC253x/CC26x2, CH340).
+
+### Deploying to a Raspberry Pi 3B
+
+`nixos/pi-example/` contains a full example: a system flake that pulls this
+project straight from its git remote and a `configuration.nix` for the Pi.
+Given a Pi 3B that already runs NixOS:
+
+```bash
+cd nixos/pi-example
+# Copy the Pi's existing hardware config -- don't hand-write a new one
+scp root@zigbee-pi:/etc/nixos/hardware-configuration.nix .
+
+# Cross-compile on this machine and push the closure over SSH
+nixos-rebuild switch --flake .#zigbee-pi \
+  --target-host root@zigbee-pi --build-host localhost
+```
+
+The example wires `services.zigbee2mqtt-rs.package` to this flake's
+`packages.x86_64-linux.aarch64` output, so the Rust binary is built via real
+cross-compilation on your dev machine rather than emulated aarch64
+compilation. Everything else in the system closure (systemd, glibc, etc.)
+substitutes from `cache.nixos.org`, since aarch64-linux is a Tier-1 nixpkgs
+platform.
+
 ## Configuration
 
 Uses the same `configuration.yaml` format as zigbee2mqtt:
