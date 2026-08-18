@@ -21,7 +21,11 @@ use super::frame::{FrameType, Subsystem, ZnpCodec, ZnpFrame};
 use crate::error::{Error, Result};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-const CHANNEL_CAPACITY: usize  = 64;
+// `event_tx` (AREQ events to the bridge) uses try_send and drops on overflow
+// (see dispatch()) rather than blocking the serial read loop -- sized well
+// above typical steady-state traffic so a burst (e.g. many devices reporting
+// right after coordinator restart) doesn't silently lose messages.
+const CHANNEL_CAPACITY: usize = 256;
 
 // ── Public events that consumers receive ─────────────────────────────────────
 
