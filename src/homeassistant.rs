@@ -44,7 +44,10 @@ pub async fn publish_discovery(
                 "device": ha_device,
             });
             if has_color {
-                config["color_mode"] = json!(true);
+                // Note: no "color_mode" discovery key here -- that's not part
+                // of HA's MQTT Light JSON schema (real z2m never sets it
+                // either); only supported_color_modes is a discovery-time
+                // config key, "color_mode" is a *state*-payload field.
                 config["supported_color_modes"] = json!(["color_temp", "xy"]);
             } else if has_level {
                 config["supported_color_modes"] = json!(["brightness"]);
@@ -132,6 +135,29 @@ pub async fn publish_discovery(
         publish(mqtt, "binary_sensor", &ieee_hex, field, &config).await;
     }
 
+    // ── Action sensor (remote-control button presses) ─────────────────────
+    // Mirrors z2m's `homeassistant.legacy_action_sensor` option: a plain
+    // sensor with an icon, no device_class/unit -- only published for
+    // devices that can actually produce `action` values (i.e. ones with a
+    // bound output cluster a button press would arrive on).
+    let has_action_output = device
+        .all_output_clusters()
+        .iter()
+        .any(|c| matches!(c, 0x0005 | 0x0006 | 0x0008));
+    if has_action_output {
+        let config = json!({
+            "availability": availability,
+            "state_topic": format!("{}/{}", base_topic, device.friendly_name),
+            "object_id": format!("{}_action", device.friendly_name),
+            "unique_id": format!("{ieee_hex}_action_{base_topic}"),
+            "device": ha_device,
+            "icon": "mdi:gesture-double-tap",
+            "value_template": "{{ value_json.action }}",
+            "enabled_by_default": true,
+        });
+        publish(mqtt, "sensor", &ieee_hex, "action", &config).await;
+    }
+
     // ── Link quality diagnostic sensor ────────────────────────────────────
     {
         let config = json!({
@@ -180,15 +206,21 @@ async fn publish_sensor(ctx: &SensorDiscoveryCtx<'_>, device_class: &str, unit: 
     publish(mqtt, "sensor", ieee_hex, device_class, &config).await;
 }
 
-fn device_block(device: &Device, base_topic: &str, coordinator_ieee: &str) -> Value {
+fn device_block(device: &Device, _base_topic: &str, coordinator_ieee: &str) -> Value {
     let ieee_hex = device.ieee_addr.as_hex();
+    // z2m hardcodes the "zigbee2mqtt" identifier prefix regardless of the
+    // configured MQTT base_topic (only *groups* incorporate base_topic, which
+    // this project doesn't support) -- HA matches devices across restarts/
+    // migrations by `identifiers`, so using our own base_topic here would
+    // make HA treat every device as new whenever base_topic isn't literally
+    // "zigbee2mqtt", breaking migration from a real zigbee2mqtt install.
     json!({
-        "identifiers": [format!("{base_topic}_{ieee_hex}")],
+        "identifiers": [format!("zigbee2mqtt_{ieee_hex}")],
         "name": device.friendly_name,
         "manufacturer": device.manufacturer.as_deref().unwrap_or("Unknown"),
         "model": device.model.as_deref().unwrap_or("Unknown"),
         "sw_version": device.sw_build_id,
-        "via_device": format!("{base_topic}_bridge_{coordinator_ieee}"),
+        "via_device": format!("zigbee2mqtt_{coordinator_ieee}"),
     })
 }
 
@@ -345,9 +377,32 @@ mod tests {
         assert_eq!(block["manufacturer"], "IKEA");
         assert_eq!(block["model"], "TRADFRI bulb E26/E27");
 
-        // z2m: via_device = "zigbee2mqtt_bridge_0x..."
+        // z2m: via_device = "zigbee2mqtt_0x..." (same identifier scheme as
+        // any device, keyed by the coordinator's own IEEE -- no "_bridge_"
+        // infix)
         let via = block["via_device"].as_str().unwrap();
-        assert!(via.starts_with("zigbee2mqtt_bridge_0x"));
+        assert!(via.starts_with("zigbee2mqtt_0x"));
+    }
+
+    #[test]
+    fn device_block_identifiers_ignore_configured_base_topic() {
+        // z2m hardcodes the "zigbee2mqtt" identifier prefix regardless of
+        // the configured MQTT base_topic (only *groups* incorporate
+        // base_topic, which this project doesn't support). HA matches
+        // devices across restarts/migrations by `identifiers`, so this must
+        // NOT vary with base_topic -- otherwise every device would look "new"
+        // to HA whenever base_topic isn't literally "zigbee2mqtt" (e.g. this
+        // project's own config.example.yaml sets "zigbee2mqtt-rs").
+        let dev = make_light();
+        let block = device_block(&dev, "zigbee2mqtt-rs", COORD_IEEE);
+
+        let ids = block["identifiers"].as_array().unwrap();
+        assert!(ids[0].as_str().unwrap().starts_with("zigbee2mqtt_0x"));
+        assert!(!ids[0].as_str().unwrap().contains("zigbee2mqtt-rs"));
+
+        let via = block["via_device"].as_str().unwrap();
+        assert!(via.starts_with("zigbee2mqtt_0x"));
+        assert!(!via.contains("zigbee2mqtt-rs"));
     }
 
     // ── Light discovery (z2m format) ──────────────────────────────────────
@@ -388,6 +443,66 @@ mod tests {
         // supported_color_modes present
         let modes = config["supported_color_modes"].as_array().unwrap();
         assert!(modes.contains(&json!("brightness")));
+    }
+
+    #[test]
+    fn color_light_discovery_has_no_color_mode_key() {
+        // "color_mode" isn't part of HA's MQTT Light JSON discovery schema
+        // (it's a *state*-payload field) -- real z2m never sets it in the
+        // discovery config, only `supported_color_modes`.
+        let dev = make_color_light();
+        let ieee = dev.ieee_addr.as_hex();
+        let ha_dev = device_block(&dev, BASE, COORD_IEEE);
+        let avail = availability_block(BASE);
+
+        let mut config = json!({
+            "availability": avail,
+            "brightness": true,
+            "brightness_scale": 254,
+            "command_topic": format!("{BASE}/color_bulb/set"),
+            "state_topic": format!("{BASE}/color_bulb"),
+            "schema": "json",
+            "object_id": "color_bulb",
+            "unique_id": format!("{ieee}_light_{BASE}"),
+            "device": ha_dev,
+        });
+        config["supported_color_modes"] = json!(["color_temp", "xy"]);
+
+        assert!(config.get("color_mode").is_none());
+        assert_eq!(
+            config["supported_color_modes"],
+            json!(["color_temp", "xy"])
+        );
+    }
+
+    #[test]
+    fn action_sensor_only_for_devices_with_action_capable_output_cluster() {
+        // Ordinary bulb: no output clusters -> no action sensor.
+        let bulb = make_light();
+        assert!(!bulb
+            .all_output_clusters()
+            .iter()
+            .any(|c| matches!(c, 0x0005 | 0x0006 | 0x0008)));
+
+        // Remote control: genOnOff/genLevelCtrl/genScenes as *output*
+        // clusters (bound to the coordinator so button presses arrive) ->
+        // action sensor should be published.
+        let mut remote = Device::new(
+            IeeeAddr([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]),
+            0x1111,
+        );
+        remote.friendly_name = "remote".to_string();
+        remote.endpoints.push(EndpointDesc {
+            endpoint: 1,
+            profile_id: 0x0104,
+            device_id: 0x0810,
+            input_clusters: vec![0x0000, 0x0001],
+            output_clusters: vec![0x0006, 0x0008, 0x0005],
+        });
+        assert!(remote
+            .all_output_clusters()
+            .iter()
+            .any(|c| matches!(c, 0x0005 | 0x0006 | 0x0008)));
     }
 
     #[test]

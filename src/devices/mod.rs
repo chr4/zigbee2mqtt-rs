@@ -81,6 +81,19 @@ impl Device {
         "Router"
     }
 
+    /// All unique output clusters across all endpoints.
+    #[must_use]
+    pub fn all_output_clusters(&self) -> Vec<u16> {
+        let mut clusters: Vec<u16> = self
+            .endpoints
+            .iter()
+            .flat_map(|ep| ep.output_clusters.iter().copied())
+            .collect();
+        clusters.sort_unstable();
+        clusters.dedup();
+        clusters
+    }
+
     /// All unique input clusters across all endpoints.
     #[must_use]
     pub fn all_input_clusters(&self) -> Vec<u16> {
