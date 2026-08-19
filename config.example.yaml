@@ -27,6 +27,21 @@ permit_join: true
 # Publish Home Assistant MQTT auto-discovery messages.
 homeassistant: true
 
+# Advanced Zigbee network / MQTT publishing settings. Every field defaults
+# to the same value zigbee2mqtt itself defaults to (pan_id 0x1a62, channel
+# 11, etc.), so this can be left as an empty object -- or omitted entirely --
+# unless you want to override something. For example, to change how device
+# state is published to MQTT:
+#   advanced:
+#     output: attribute_and_json
+# output accepts:
+#   json (default)     - single merged JSON message; required for Home
+#                        Assistant discovery
+#   attribute          - each state key as its own raw-value subtopic,
+#                        e.g. <base_topic>/<friendly_name>/action -> "toggle"
+#   attribute_and_json - both of the above
+advanced: {}
+
 devices:
   '0xec1bbdfffeaa66db':
     friendly_name: '0xec1bbdfffeaa66db'

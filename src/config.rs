@@ -270,4 +270,16 @@ mod tests {
     fn output_mode_rejects_unknown_value() {
         assert!(serde_yml::from_str::<OutputMode>("bogus").is_err());
     }
+
+    #[test]
+    fn shipped_example_config_parses() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config.example.yaml");
+        let content = std::fs::read_to_string(&path).expect("config.example.yaml must exist");
+        let cfg: Config = serde_yml::from_str(&content).expect("must parse as valid Config");
+        // `advanced: {}` in the example must resolve to actual defaults, not
+        // some parsed-but-empty/null state.
+        assert_eq!(cfg.advanced.channel, 11);
+        assert_eq!(cfg.advanced.output, OutputMode::Json);
+        cfg.validate().expect("example config must pass validation");
+    }
 }
