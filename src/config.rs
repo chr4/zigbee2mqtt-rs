@@ -71,19 +71,24 @@ pub struct DeviceConfig {
 /// How device state is published to MQTT (z2m: `advanced.output`).
 ///
 /// - `Json`: single merged JSON message to `<base_topic>/<friendly_name>`
-///   (this project's only behavior prior to this option -- still the
-///   default, and required for the Home Assistant discovery configs in
-///   `homeassistant.rs`, which reference the JSON state_topic/value_template).
+///   (this project's only behavior prior to this option, and still real
+///   zigbee2mqtt's own default). Required for the Home Assistant discovery
+///   configs in `homeassistant.rs`, which reference the JSON
+///   state_topic/value_template.
 /// - `Attribute`: each state key published as its own raw-value subtopic,
 ///   e.g. `<base_topic>/<friendly_name>/action` with payload `toggle`
-///   (unquoted). No merged JSON message is published in this mode.
-/// - `AttributeAndJson`: both of the above.
+///   (unquoted). No merged JSON message is published in this mode -- this
+///   alone would break Home Assistant discovery.
+/// - `AttributeAndJson`: both of the above. This project's default
+///   (deliberately different from upstream z2m, which defaults to `Json`),
+///   since the per-attribute subtopics are commonly useful and this mode
+///   keeps the JSON message HA discovery depends on.
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum OutputMode {
-    #[default]
     Json,
     Attribute,
+    #[default]
     AttributeAndJson,
 }
 
@@ -240,11 +245,17 @@ mod tests {
     }
 
     #[test]
-    fn output_mode_defaults_to_json() {
-        assert_eq!(AdvancedConfig::default().output, OutputMode::Json);
-        // Omitting `output` entirely from YAML must default to Json too.
+    fn output_mode_defaults_to_attribute_and_json() {
+        // This project's default deliberately differs from upstream
+        // zigbee2mqtt (which defaults to Json) -- see OutputMode's doc
+        // comment.
+        assert_eq!(
+            AdvancedConfig::default().output,
+            OutputMode::AttributeAndJson
+        );
+        // Omitting `output` entirely from YAML must default the same way.
         let cfg: AdvancedConfig = serde_yml::from_str("channel: 15").unwrap();
-        assert_eq!(cfg.output, OutputMode::Json);
+        assert_eq!(cfg.output, OutputMode::AttributeAndJson);
     }
 
     #[test]
@@ -276,7 +287,7 @@ mod tests {
         // `advanced: {}` in the example must resolve to actual defaults, not
         // some parsed-but-empty/null state.
         assert_eq!(cfg.advanced.channel, 11);
-        assert_eq!(cfg.advanced.output, OutputMode::Json);
+        assert_eq!(cfg.advanced.output, OutputMode::AttributeAndJson);
         cfg.validate().expect("example config must pass validation");
     }
 }
