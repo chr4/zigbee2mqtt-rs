@@ -95,7 +95,6 @@ pub struct AdvancedConfig {
     pub channel: u8,
     pub network_key: [u8; 16],
     pub log_level: String,
-    pub report_state_interval: u64,
     pub cache_state: bool,
     pub output: OutputMode,
 }
@@ -108,7 +107,6 @@ impl std::fmt::Debug for AdvancedConfig {
             .field("channel", &self.channel)
             .field("network_key", &"<redacted>")
             .field("log_level", &self.log_level)
-            .field("report_state_interval", &self.report_state_interval)
             .field("cache_state", &self.cache_state)
             .field("output", &self.output)
             .finish()
@@ -149,7 +147,6 @@ impl Default for AdvancedConfig {
             channel: 11,
             network_key: [1, 3, 5, 7, 9, 11, 13, 15, 0, 2, 4, 6, 8, 10, 12, 13],
             log_level: "info".to_string(),
-            report_state_interval: 0,
             cache_state: true,
             output: OutputMode::default(),
         }
