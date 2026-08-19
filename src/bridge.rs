@@ -8,13 +8,14 @@ use tracing::{debug, error, info, warn};
 
 use std::path::PathBuf;
 
-use crate::config::Config;
+use crate::config::{Config, OutputMode};
 use crate::coordinator::znp::ZnpHandle;
 use crate::coordinator::{open_coordinator, CoordinatorEvent, CoordinatorHandle};
 use crate::database;
 use crate::devices::{Device, DeviceRegistry};
 use crate::error::Result;
 use crate::homeassistant;
+use crate::mqtt::attribute_output::flatten_attribute_output;
 use crate::mqtt::{MqttBridge, MqttCommand};
 use crate::zigbee::zcl;
 use crate::zigbee::zcl::clusters::color;
@@ -313,9 +314,7 @@ impl Bridge {
                                         // `state`, built just above, for this one publish).
                                         Self::strip_transient_action_fields(&mut dev.state);
                                         drop(dev);
-                                        if let Err(e) = mqtt.publish_device_state(&name, &state).await {
-                                            warn!("Failed to publish device state: {e}");
-                                        }
+                                        Self::publish_state(&mqtt, self.cfg.advanced.output, &name, &state).await;
                                     }
                                 }
                                 Ok(None) => {}
@@ -345,7 +344,7 @@ impl Bridge {
                         Some(MqttCommand::SetDevice { friendly_name, payload }) => {
                             info!("MQTT set: {friendly_name} -> {payload}");
                             Self::handle_set(
-                                &devices, &coord, &mqtt, &mut trans_id,
+                                &devices, &coord, &mqtt, self.cfg.advanced.output, &mut trans_id,
                                 &friendly_name, &payload,
                             ).await;
                         }
@@ -353,9 +352,7 @@ impl Bridge {
                             debug!("MQTT get: {friendly_name}");
                             if let Some(dev) = devices.find_by_name(&friendly_name) {
                                 let state = serde_json::Value::Object(dev.state);
-                                if let Err(e) = mqtt.publish_device_state(&friendly_name, &state).await {
-                                    warn!("Failed to publish device state: {e}");
-                                }
+                                Self::publish_state(&mqtt, self.cfg.advanced.output, &friendly_name, &state).await;
                             } else {
                                 warn!("Get command for unknown device: {friendly_name}");
                             }
@@ -438,9 +435,7 @@ impl Bridge {
 
         for dev in self.devices.all_devices() {
             let state = serde_json::Value::Object(dev.state.clone());
-            if let Err(e) = mqtt.publish_device_state(&dev.friendly_name, &state).await {
-                warn!("Failed to publish state for {}: {e}", dev.friendly_name);
-            }
+            Self::publish_state(mqtt, self.cfg.advanced.output, &dev.friendly_name, &state).await;
 
             if self.cfg.homeassistant && dev.interview_complete {
                 homeassistant::publish_discovery(
@@ -460,6 +455,7 @@ impl Bridge {
         devices: &DeviceRegistry,
         coord: &CoordinatorHandle,
         mqtt: &MqttBridge,
+        output: OutputMode,
         trans_id: &mut u8,
         name: &str,
         payload: &serde_json::Value,
@@ -592,9 +588,7 @@ impl Bridge {
             // Publish the full merged state
             if let Some(dev) = devices.find_by_name(name) {
                 let full_state = serde_json::Value::Object(dev.state);
-                if let Err(e) = mqtt.publish_device_state(name, &full_state).await {
-                    warn!("Failed to publish device state: {e}");
-                }
+                Self::publish_state(mqtt, output, name, &full_state).await;
             }
         }
     }
@@ -609,6 +603,57 @@ impl Bridge {
     /// current message, so the action still appears in that one publish.
     fn strip_transient_action_fields(state: &mut serde_json::Map<String, serde_json::Value>) {
         state.retain(|k, _| k != "action" && !k.starts_with("action_"));
+    }
+
+    /// Publish a device's state per `advanced.output` (z2m's
+    /// `Controller.publishEntityState`): the merged JSON message, each state
+    /// key as its own flattened raw-value subtopic, or both. All state
+    /// publishes should go through this rather than calling
+    /// `mqtt.publish_device_state` directly, so every call site respects the
+    /// configured output mode uniformly.
+    async fn publish_state(
+        mqtt: &MqttBridge,
+        output: OutputMode,
+        friendly_name: &str,
+        state: &serde_json::Value,
+    ) {
+        let (publish_json, attributes) = Self::plan_state_publishes(output, state);
+
+        if publish_json {
+            if let Err(e) = mqtt.publish_device_state(friendly_name, state).await {
+                warn!("Failed to publish device state: {e}");
+            }
+        }
+        for (key_path, value) in attributes {
+            if let Err(e) = mqtt
+                .publish_device_attribute(friendly_name, &key_path, &value)
+                .await
+            {
+                warn!("Failed to publish attribute {key_path} for {friendly_name}: {e}");
+            }
+        }
+    }
+
+    /// Decides *what* `publish_state` should publish for a given output mode,
+    /// split out from the actual MQTT I/O above purely so this branching is
+    /// unit-testable without a live broker connection: returns whether the
+    /// merged-JSON message should be published, and the flattened
+    /// `(key_path, value)` attribute pairs (empty unless `output` is
+    /// `Attribute`/`AttributeAndJson`).
+    fn plan_state_publishes(
+        output: OutputMode,
+        state: &serde_json::Value,
+    ) -> (bool, Vec<(String, String)>) {
+        let publish_json = matches!(output, OutputMode::Json | OutputMode::AttributeAndJson);
+        let attributes = if matches!(output, OutputMode::Attribute | OutputMode::AttributeAndJson) {
+            state
+                .as_object()
+                .map(flatten_attribute_output)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        (publish_json, attributes)
     }
 
     /// Handle basic cluster (0x0000) Read Attributes Response to update device metadata.
@@ -822,6 +867,34 @@ mod tests {
         assert_eq!(state.get("brightness"), Some(&json!(200)));
         assert_eq!(state.get("battery"), Some(&json!(80)));
         assert_eq!(state.get("state"), Some(&json!("ON")));
+    }
+
+    #[test]
+    fn output_json_publishes_only_merged_state() {
+        let state = json!({"state": "ON", "brightness": 200});
+        let (publish_json, attributes) = Bridge::plan_state_publishes(OutputMode::Json, &state);
+        assert!(publish_json);
+        assert!(attributes.is_empty());
+    }
+
+    #[test]
+    fn output_attribute_publishes_only_flattened_attributes() {
+        let state = json!({"state": "ON", "brightness": 200});
+        let (publish_json, attributes) =
+            Bridge::plan_state_publishes(OutputMode::Attribute, &state);
+        assert!(!publish_json);
+        assert_eq!(attributes.len(), 2);
+        assert!(attributes.contains(&("state".to_string(), "ON".to_string())));
+        assert!(attributes.contains(&("brightness".to_string(), "200".to_string())));
+    }
+
+    #[test]
+    fn output_attribute_and_json_publishes_both() {
+        let state = json!({"state": "ON", "brightness": 200});
+        let (publish_json, attributes) =
+            Bridge::plan_state_publishes(OutputMode::AttributeAndJson, &state);
+        assert!(publish_json);
+        assert_eq!(attributes.len(), 2);
     }
 
     #[test]

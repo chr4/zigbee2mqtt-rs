@@ -1,5 +1,7 @@
 /// MQTT bridge – publishes device state and subscribes to set/get commands.
 /// Message formats are compatible with zigbee2mqtt for Home Assistant integration.
+pub mod attribute_output;
+
 use std::time::Duration;
 
 use rumqttc::{AsyncClient, Event, EventLoop, MqttOptions, Packet, QoS};
@@ -107,6 +109,22 @@ impl MqttBridge {
         let topic = format!("{}/{}", self.base_topic, friendly_name);
         let payload = serde_json::to_vec(state)?;
         self.publish_retained(&topic, &payload).await
+    }
+
+    /// Publish one raw attribute value for `advanced.output: attribute`/
+    /// `attribute_and_json` mode -- z2m: topic
+    /// `<base_topic>/<friendly_name>/<key_path>`, unquoted raw string
+    /// payload, retained (same as the merged-JSON publish). See
+    /// `attribute_output::flatten_attribute_output` for how `key_path`/
+    /// `value` are derived from a device's state.
+    pub async fn publish_device_attribute(
+        &self,
+        friendly_name: &str,
+        key_path: &str,
+        value: &str,
+    ) -> Result<()> {
+        let topic = format!("{}/{}/{}", self.base_topic, friendly_name, key_path);
+        self.publish_retained(&topic, value.as_bytes()).await
     }
 
     pub async fn publish_bridge_devices(&self, devices: &serde_json::Value) -> Result<()> {

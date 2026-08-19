@@ -68,6 +68,25 @@ pub struct DeviceConfig {
     pub disabled: Option<bool>,
 }
 
+/// How device state is published to MQTT (z2m: `advanced.output`).
+///
+/// - `Json`: single merged JSON message to `<base_topic>/<friendly_name>`
+///   (this project's only behavior prior to this option -- still the
+///   default, and required for the Home Assistant discovery configs in
+///   `homeassistant.rs`, which reference the JSON state_topic/value_template).
+/// - `Attribute`: each state key published as its own raw-value subtopic,
+///   e.g. `<base_topic>/<friendly_name>/action` with payload `toggle`
+///   (unquoted). No merged JSON message is published in this mode.
+/// - `AttributeAndJson`: both of the above.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputMode {
+    #[default]
+    Json,
+    Attribute,
+    AttributeAndJson,
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct AdvancedConfig {
@@ -78,6 +97,7 @@ pub struct AdvancedConfig {
     pub log_level: String,
     pub report_state_interval: u64,
     pub cache_state: bool,
+    pub output: OutputMode,
 }
 
 impl std::fmt::Debug for AdvancedConfig {
@@ -90,6 +110,7 @@ impl std::fmt::Debug for AdvancedConfig {
             .field("log_level", &self.log_level)
             .field("report_state_interval", &self.report_state_interval)
             .field("cache_state", &self.cache_state)
+            .field("output", &self.output)
             .finish()
     }
 }
@@ -130,6 +151,7 @@ impl Default for AdvancedConfig {
             log_level: "info".to_string(),
             report_state_interval: 0,
             cache_state: true,
+            output: OutputMode::default(),
         }
     }
 }
@@ -218,5 +240,34 @@ mod tests {
         let mut cfg = Config::default();
         cfg.mqtt.base_topic = String::new();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn output_mode_defaults_to_json() {
+        assert_eq!(AdvancedConfig::default().output, OutputMode::Json);
+        // Omitting `output` entirely from YAML must default to Json too.
+        let cfg: AdvancedConfig = serde_yml::from_str("channel: 15").unwrap();
+        assert_eq!(cfg.output, OutputMode::Json);
+    }
+
+    #[test]
+    fn output_mode_parses_all_three_z2m_values() {
+        assert_eq!(
+            serde_yml::from_str::<OutputMode>("json").unwrap(),
+            OutputMode::Json
+        );
+        assert_eq!(
+            serde_yml::from_str::<OutputMode>("attribute").unwrap(),
+            OutputMode::Attribute
+        );
+        assert_eq!(
+            serde_yml::from_str::<OutputMode>("attribute_and_json").unwrap(),
+            OutputMode::AttributeAndJson
+        );
+    }
+
+    #[test]
+    fn output_mode_rejects_unknown_value() {
+        assert!(serde_yml::from_str::<OutputMode>("bogus").is_err());
     }
 }
