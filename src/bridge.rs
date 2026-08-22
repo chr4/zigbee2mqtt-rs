@@ -250,6 +250,22 @@ impl Bridge {
                                 }
                             }
 
+                            // Request Power Configuration battery attributes, so the
+                            // battery/battery_voltage state keys (and the HA battery
+                            // sensor discovered for this device) actually get a value
+                            // instead of waiting on an unsolicited report that most
+                            // devices never send without being asked.
+                            if input_clusters.contains(&0x0001) {
+                                trans_id = trans_id.wrapping_add(1);
+                                let payload = crate::zigbee::zcl::frame::read_attributes_payload(
+                                    trans_id,
+                                    &[0x0020, 0x0021],
+                                );
+                                if let Err(e) = coord.send_zcl(nwk_addr, endpoint, 0x0001, trans_id, payload).await {
+                                    warn!("Failed to send ZCL read attributes (Power Configuration): {e}");
+                                }
+                            }
+
                             Self::publish_device_list_static(&devices, &mqtt).await;
 
                             // Publish HA discovery after interview
@@ -895,6 +911,36 @@ mod tests {
             Bridge::plan_state_publishes(OutputMode::AttributeAndJson, &state);
         assert!(publish_json);
         assert_eq!(attributes.len(), 2);
+    }
+
+    /// Reproduces the exact per-message sequence in the `CoordinatorEvent::
+    /// Message` handler (merge_state -> clone into `state` -> strip transient
+    /// action fields from retained `dev.state` -> plan_state_publishes) for
+    /// two consecutive button clicks reporting the *same* action value, in
+    /// `AttributeAndJson` mode. Guards against the flattened `action`
+    /// attribute topic silently going stale/missing on repeat presses.
+    #[test]
+    fn repeated_identical_action_is_flattened_every_click() {
+        let mut dev = Device::new(IeeeAddr::from_hex("0x00158d0001020304").unwrap(), 0x1234);
+
+        for _ in 0..2 {
+            let mut values = serde_json::Map::new();
+            values.insert("action".into(), json!("toggle"));
+            dev.merge_state(values);
+            dev.state.insert("linkquality".into(), json!(200));
+
+            let state = serde_json::Value::Object(dev.state.clone());
+            Bridge::strip_transient_action_fields(&mut dev.state);
+
+            let (publish_json, attributes) =
+                Bridge::plan_state_publishes(OutputMode::AttributeAndJson, &state);
+            assert!(publish_json);
+            assert!(
+                attributes.contains(&("action".to_string(), "toggle".to_string())),
+                "action attribute missing from flattened publish: {attributes:?}"
+            );
+            assert!(!dev.state.contains_key("action"));
+        }
     }
 
     #[test]
