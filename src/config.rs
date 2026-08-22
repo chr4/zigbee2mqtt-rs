@@ -79,16 +79,13 @@ pub struct DeviceConfig {
 ///   e.g. `<base_topic>/<friendly_name>/action` with payload `toggle`
 ///   (unquoted). No merged JSON message is published in this mode -- this
 ///   alone would break Home Assistant discovery.
-/// - `AttributeAndJson`: both of the above. This project's default
-///   (deliberately different from upstream z2m, which defaults to `Json`),
-///   since the per-attribute subtopics are commonly useful and this mode
-///   keeps the JSON message HA discovery depends on.
+/// - `AttributeAndJson`: both of the above.
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum OutputMode {
+    #[default]
     Json,
     Attribute,
-    #[default]
     AttributeAndJson,
 }
 
@@ -245,17 +242,13 @@ mod tests {
     }
 
     #[test]
-    fn output_mode_defaults_to_attribute_and_json() {
-        // This project's default deliberately differs from upstream
-        // zigbee2mqtt (which defaults to Json) -- see OutputMode's doc
-        // comment.
-        assert_eq!(
-            AdvancedConfig::default().output,
-            OutputMode::AttributeAndJson
-        );
+    fn output_mode_defaults_to_json() {
+        // Matches upstream zigbee2mqtt's own default -- see OutputMode's
+        // doc comment.
+        assert_eq!(AdvancedConfig::default().output, OutputMode::Json);
         // Omitting `output` entirely from YAML must default the same way.
         let cfg: AdvancedConfig = serde_yml::from_str("channel: 15").unwrap();
-        assert_eq!(cfg.output, OutputMode::AttributeAndJson);
+        assert_eq!(cfg.output, OutputMode::Json);
     }
 
     #[test]
@@ -284,10 +277,10 @@ mod tests {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config.example.yaml");
         let content = std::fs::read_to_string(&path).expect("config.example.yaml must exist");
         let cfg: Config = serde_yml::from_str(&content).expect("must parse as valid Config");
-        // `advanced: {}` in the example must resolve to actual defaults, not
-        // some parsed-but-empty/null state.
+        // The example omits `advanced:` entirely -- it must still resolve
+        // to actual defaults via Config's struct-level `#[serde(default)]`.
         assert_eq!(cfg.advanced.channel, 11);
-        assert_eq!(cfg.advanced.output, OutputMode::AttributeAndJson);
+        assert_eq!(cfg.advanced.output, OutputMode::Json);
         cfg.validate().expect("example config must pass validation");
     }
 }

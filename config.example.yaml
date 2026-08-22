@@ -29,18 +29,19 @@ homeassistant: true
 
 # Advanced Zigbee network / MQTT publishing settings. Every field defaults
 # to the same value zigbee2mqtt itself defaults to (pan_id 0x1a62, channel
-# 11, etc.), EXCEPT `output` below -- so this can be left as an empty object
-# -- or omitted entirely -- unless you want to override something.
+# 11, output json, etc.), so the whole `advanced:` section can be omitted
+# unless you want to override something. Uncomment and adjust as needed:
 #
-# output: how device state is published to MQTT --
-#   json               - single merged JSON message; required for Home
-#                        Assistant discovery
-#   attribute          - each state key as its own raw-value subtopic,
-#                        e.g. <base_topic>/<friendly_name>/action -> "toggle"
-#   attribute_and_json - both of the above (this project's default --
-#                        deliberately different from upstream zigbee2mqtt,
-#                        which defaults to json-only)
-advanced: {}
+# advanced:
+#   channel: 15
+#   # output: how device state is published to MQTT --
+#   #   json               - single merged JSON message; required for Home
+#   #                        Assistant discovery (default, matches upstream
+#   #                        zigbee2mqtt)
+#   #   attribute          - each state key as its own raw-value subtopic,
+#   #                        e.g. <base_topic>/<friendly_name>/action -> "toggle"
+#   #   attribute_and_json - both of the above
+#   output: json
 
 devices:
   '0xec1bbdfffeaa66db':
