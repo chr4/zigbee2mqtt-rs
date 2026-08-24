@@ -18,3 +18,4 @@ services:
 
 volumes:
   claude_state:
+    name: claude_state
