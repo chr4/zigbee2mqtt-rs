@@ -93,19 +93,29 @@ pub fn util_get_device_info() -> ZnpFrame {
     ZnpFrame::sreq(Subsystem::Util, util::GET_DEVICE_INFO, vec![])
 }
 
+/// ZDO device state reported once the stack is up as coordinator
+/// (zigpy-znp `DeviceState.StartedAsCoordinator`).
+pub const DEVICE_STATE_STARTED_AS_COORDINATOR: u8 = 0x09;
+
 #[derive(Debug, Clone)]
 pub struct DeviceInfo {
     pub ieee_addr: [u8; 8],
+    pub device_state: Option<u8>,
 }
 
 impl DeviceInfo {
+    /// Layout per zigpy-znp's `UTIL.GetDeviceInfo` response: Status(u8)
+    /// IEEE(8) NWK(u16) DeviceType(u8) DeviceState(u8) AssociatedDevices.
     pub fn parse(data: &[u8]) -> Option<Self> {
-        if data.len() < 8 {
+        if data.len() < 9 || data[0] != 0 {
             return None;
         }
         let mut ieee = [0u8; 8];
-        ieee.copy_from_slice(&data[0..8]);
-        Some(Self { ieee_addr: ieee })
+        ieee.copy_from_slice(&data[1..9]);
+        Some(Self {
+            ieee_addr: ieee,
+            device_state: data.get(12).copied(),
+        })
     }
 }
 
@@ -154,7 +164,7 @@ pub fn af_data_request(
     data.push(src_ep);
     data.extend_from_slice(&cluster_id.to_le_bytes());
     data.push(trans_id);
-    data.push(0x30); // options: AF_DISCV_ROUTE | AF_EN_SECURITY
+    data.push(0x30); // options: AF_ACK_REQUEST (0x10) | AF_DISCV_ROUTE (0x20)
     data.push(0xFF); // radius: max
     data.push(payload.len() as u8);
     data.extend(payload);
@@ -326,16 +336,26 @@ impl EndDeviceAnnceInd {
 #[derive(Debug, Clone)]
 pub struct LeaveInd {
     pub ieee_addr: [u8; 8],
+    /// The device intends to rejoin (e.g. moving to a new parent), so it
+    /// shouldn't be forgotten.
+    pub rejoin: bool,
 }
 
 impl LeaveInd {
+    /// Layout per zigpy-znp's `ZDO.LeaveInd`: NWK(u16) IEEE(8) Request(u8)
+    /// Remove(u8) Rejoin(u8). A frame truncated before Rejoin is treated as a
+    /// plain leave.
     pub fn parse(data: &[u8]) -> Option<Self> {
         if data.len() < 10 {
             return None;
         }
         let mut ieee = [0u8; 8];
         ieee.copy_from_slice(&data[2..10]);
-        Some(Self { ieee_addr: ieee })
+        let rejoin = data.get(12).is_some_and(|&b| b != 0);
+        Some(Self {
+            ieee_addr: ieee,
+            rejoin,
+        })
     }
 }
 
@@ -537,6 +557,52 @@ mod tests {
             ind.ieee_addr,
             [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]
         );
+    }
+
+    #[test]
+    fn parse_device_info_skips_status_byte() {
+        let data = vec![
+            0x00, // status
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, // ieee
+            0x00, 0x00, // nwk
+            0x07, // device type
+            0x09, // device state: started as coordinator
+            0x00, // associated device count
+        ];
+        let info = DeviceInfo::parse(&data).unwrap();
+        assert_eq!(info.ieee_addr, [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(info.device_state, Some(DEVICE_STATE_STARTED_AS_COORDINATOR));
+    }
+
+    #[test]
+    fn parse_device_info_failure_status() {
+        let mut data = vec![0x01];
+        data.extend_from_slice(&[0u8; 13]);
+        assert!(DeviceInfo::parse(&data).is_none());
+    }
+
+    #[test]
+    fn parse_leave_ind_rejoin() {
+        let mut data = vec![
+            0x34, 0x12, // nwk
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, // ieee
+            0x00, // request
+            0x00, // remove children
+            0x01, // rejoin
+        ];
+        let ind = LeaveInd::parse(&data).unwrap();
+        assert_eq!(ind.ieee_addr, [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert!(ind.rejoin);
+
+        data[12] = 0x00;
+        assert!(!LeaveInd::parse(&data).unwrap().rejoin);
+    }
+
+    #[test]
+    fn parse_leave_ind_truncated_is_plain_leave() {
+        let data = vec![0x34, 0x12, 1, 2, 3, 4, 5, 6, 7, 8];
+        assert!(!LeaveInd::parse(&data).unwrap().rejoin);
+        assert!(LeaveInd::parse(&data[..9]).is_none());
     }
 
     #[test]
