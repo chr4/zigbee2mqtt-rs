@@ -140,6 +140,39 @@ pub fn ha_binary_sensor_fields(zone_type: Option<u16>) -> (&'static str, bool, b
     }
 }
 
+// ── Enrollment ───────────────────────────────────────────────────────────────
+//
+// An IAS Zone server only sends Zone Status Change Notifications to its CIE
+// once enrolled: the CIE writes its own IEEE address to IAS_CIE_Address and
+// answers the device's Zone Enroll Request with a Zone Enroll Response.
+// Devices imported from a z2m database.db were already enrolled by z2m; freshly
+// paired ones are not, and stay silent without this.
+
+const IAS_CIE_ADDRESS: u16 = 0x0010;
+const DATA_TYPE_IEEE_ADDR: u8 = 0xF0;
+/// Client → server: Zone Enroll Response.
+const CMD_ZONE_ENROLL_RSP: u8 = 0x00;
+/// Server → client: Zone Enroll Request.
+pub const CMD_ZONE_ENROLL_REQ: u8 = 0x01;
+/// Zone ID assigned on enrollment. Unsourced: zigbee-herdsman is recalled to
+/// use 23; any value 0x00-0xFE is valid per ZCL.
+pub const DEFAULT_ZONE_ID: u8 = 23;
+
+/// Global Write Attributes: IAS_CIE_Address = `cie_ieee` (little-endian wire
+/// order, as held in `IeeeAddr.0`).
+pub fn write_cie_address_payload(sequence: u8, cie_ieee: [u8; 8]) -> Vec<u8> {
+    let mut p = vec![0x10, sequence, 0x02]; // global, client→server, no default rsp; Write Attributes
+    p.extend_from_slice(&IAS_CIE_ADDRESS.to_le_bytes());
+    p.push(DATA_TYPE_IEEE_ADDR);
+    p.extend_from_slice(&cie_ieee);
+    p
+}
+
+/// Zone Enroll Response with status success.
+pub fn enroll_response_payload(sequence: u8, zone_id: u8) -> Vec<u8> {
+    vec![0x11, sequence, CMD_ZONE_ENROLL_RSP, 0x00, zone_id]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,5 +304,18 @@ mod tests {
         assert_eq!(ha_device_class(Some(ZONE_TYPE_FIRE_SENSOR)), "smoke");
         assert_eq!(ha_device_class(None), "door");
         assert_eq!(ha_device_class(Some(0x0015)), "door"); // Contact Switch
+    }
+
+    #[test]
+    fn write_cie_address_payload_format() {
+        let ieee = [1, 2, 3, 4, 5, 6, 7, 8];
+        let p = write_cie_address_payload(9, ieee);
+        assert_eq!(&p[..6], &[0x10, 9, 0x02, 0x10, 0x00, 0xF0]);
+        assert_eq!(&p[6..], &ieee);
+    }
+
+    #[test]
+    fn enroll_response_payload_format() {
+        assert_eq!(enroll_response_payload(4, 23), vec![0x11, 4, 0x00, 0x00, 23]);
     }
 }

@@ -22,6 +22,7 @@ use crate::mqtt::attribute_output::flatten_attribute_output;
 use crate::mqtt::{MqttBridge, MqttCommand};
 use crate::zigbee::zcl;
 use crate::zigbee::zcl::clusters::color;
+use crate::zigbee::zcl::clusters::ias_zone;
 use crate::zigbee::zcl::clusters::level;
 use crate::zigbee::zcl::clusters::on_off;
 use crate::zigbee::{EndpointDesc, IeeeAddr};
@@ -292,6 +293,14 @@ impl Bridge {
                             }
                             if cluster_id == 0x0500 {
                                 Self::handle_ias_zone_type_response(&devices, src_addr, &data);
+                                if zcl::is_ias_enroll_request(&data) {
+                                    info!("IAS zone enroll request from 0x{src_addr:04X}, enrolling");
+                                    let znp = Arc::clone(&coord.inner);
+                                    let trans_id = Arc::clone(&trans_id);
+                                    tokio::spawn(async move {
+                                        Self::send_ias_enroll_response(&znp, &trans_id, src_addr, src_ep).await;
+                                    });
+                                }
                             }
 
                             let zone_type = devices.get_by_nwk(src_addr).and_then(|d| d.zone_type);
@@ -941,6 +950,28 @@ impl Bridge {
                 None => {}
             }
 
+            // IAS Zone enrollment: point the device at us as its CIE, then
+            // send an unsolicited Zone Enroll Response (devices that instead
+            // send a Zone Enroll Request are answered from the main loop).
+            if ep.input_clusters.contains(&0x0500) {
+                match coordinator_ieee {
+                    Some(cie) => {
+                        let tid = next_trans_id(&trans_id);
+                        let payload = ias_zone::write_cie_address_payload(tid, cie.0);
+                        let result = znp
+                            .lock()
+                            .await
+                            .send_zcl(nwk_addr, endpoint, 0x0500, tid, payload)
+                            .await;
+                        if let Err(e) = result {
+                            warn!("Failed to write IAS CIE address to 0x{nwk_addr:04X}: {e}");
+                        }
+                        Self::send_ias_enroll_response(&znp, &trans_id, nwk_addr, endpoint).await;
+                    }
+                    None => warn!("Cannot enroll IAS zone 0x{nwk_addr:04X}: coordinator IEEE address unknown"),
+                }
+            }
+
             // Basic: manufacturer, model, power source, sw build id.
             // IAS Zone: ZoneType, so zone status reports can be classified
             //   (contact/occupancy/smoke/water_leak/...) instead of always
@@ -968,6 +999,24 @@ impl Bridge {
                 }
             }
         });
+    }
+
+    async fn send_ias_enroll_response(
+        znp: &Mutex<ZnpHandle>,
+        trans_id: &AtomicU8,
+        nwk_addr: u16,
+        endpoint: u8,
+    ) {
+        let tid = next_trans_id(trans_id);
+        let payload = ias_zone::enroll_response_payload(tid, ias_zone::DEFAULT_ZONE_ID);
+        let result = znp
+            .lock()
+            .await
+            .send_zcl(nwk_addr, endpoint, 0x0500, tid, payload)
+            .await;
+        if let Err(e) = result {
+            warn!("Failed to send IAS zone enroll response to 0x{nwk_addr:04X}: {e}");
+        }
     }
 
     /// Mark the device at `nwk_addr` interviewed (if it isn't already and has
