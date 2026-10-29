@@ -21,7 +21,9 @@ A pure Rust drop-in replacement for zigbee2mqtt. Bridges Zigbee devices (via Z-S
 
 ## Architecture Decisions
 
-- **Single-threaded event loop**. The bridge runs one tokio task with `select!` over coordinator events and MQTT commands. DashMap is used for the device registry but true concurrency isn't needed -- it was chosen for ergonomic interior mutability.
+- **Event loop never blocks on round-trips**. The bridge runs one tokio task with `select!` over coordinator events, MQTT commands and a shutdown signal. Coordinator request sequences (simple-desc requests, binds, attribute reads, IAS enrollment, IEEE lookups) run in spawned tasks sharing `Arc<Mutex<ZnpHandle>>`; ZCL transaction IDs come from a shared `AtomicU8`. Never hold a DashMap ref across an `.await`.
+- **MQTT event loop must never block**. The task driving rumqttc's `EventLoop::poll()` must not await the request channel or the bridge (subscribe runs in its own task; inbound commands use an unbounded channel), otherwise a broker reconnect deadlocks. Max packet size is raised from rumqttc's 10 KiB default, which errors the *connection* on a large `bridge/devices`. Like z2m, we subscribe to `{base}/#` and route `{name}/set[/{attr}]` and `{name}/get` (names may contain `/`).
+- **Persistence**. `src/persistence.rs` merges registry changes into `database.db` (herdsman NDJSON, unknown fields/records preserved) and writes `state.json`, atomically, every 30s and on exit.
 - **Library + binary crate**. `src/lib.rs` exports all modules. `src/main.rs` is just CLI parsing. `src/bridge.rs` is in the library for testability.
 - **Static cluster handlers**. `handler_for()` returns `&'static dyn ClusterHandler` -- no heap allocation per message.
 - **ZNP transport actor**. Serial I/O runs in a spawned task. One SREQ is in flight at a time; the actor owns the 10s SRSP timeout. An SRSP matches the pending request by (subsystem, cmd1). An RPC error SRSP (subsystem 0x00, cmd1 0x00, payload `ErrorCode, ReqCmd0, ReqCmd1` -- layout per zigpy-znp `RPCError.CommandNotRecognized`) is matched by the embedded request header and returned as `Error::ZnpRejected`.
@@ -36,9 +38,8 @@ A pure Rust drop-in replacement for zigbee2mqtt. Bridges Zigbee devices (via Z-S
 
 ## Testing
 
-137 tests across 4 test targets:
-- **Library unit tests** (107): ZNP frame/command parsing, ZCL attribute/cluster handlers, device registry, HA discovery format, MQTT message parsing, database.db import
-- **Bridge unit tests** (9 in main binary): IEEE parsing, timestamp generation, transition time, endpoint lookup (these will move to lib tests in a future refactor)
+~275 tests across 2 test targets:
+- **Library unit tests**: ZNP frame/command parsing and SRSP matching, ZCL attribute/cluster handlers, device registry, HA discovery format, MQTT routing, database.db import/persistence, bridge helpers
 - **z2m compatibility tests** (30 in `tests/z2m_compat.rs`): End-to-end validation against real zigbee2mqtt test patterns from the upstream test suite
 
 Run: `cargo test`
@@ -61,4 +62,6 @@ Cross-compilation requires `gcc-aarch64-linux-gnu` and the `.cargo/config.toml` 
 | `src/coordinator/znp/mod.rs` | Z-Stack init sequence -- fragile, version-dependent |
 | `src/coordinator/znp/transport.rs` | Serial transport -- SREQ/SRSP matching logic |
 | `src/database.rs` | database.db import -- camelCase NDJSON parsing |
+| `src/persistence.rs` | database.db / state.json writing -- merge, don't regenerate |
+| `src/mqtt/mod.rs` | MQTT client -- event-loop task must never block |
 | `tests/z2m_compat.rs` | z2m format validation -- run after any MQTT/state changes |
