@@ -146,6 +146,15 @@ pub fn extract_ias_zone_type(raw: &[u8]) -> Result<Option<u16>> {
     Ok(clusters::ias_zone::extract_zone_type(&reports))
 }
 
+/// Whether `raw` (cluster 0x0500) is an IAS Zone Enroll Request from the device.
+pub fn is_ias_enroll_request(raw: &[u8]) -> bool {
+    matches!(
+        ZclFrameHeader::parse(raw),
+        Ok((h, _)) if h.frame_type == FrameType::ClusterSpecific
+            && h.command_id == clusters::ias_zone::CMD_ZONE_ENROLL_REQ
+    )
+}
+
 /// Parse a Read Attributes Response payload into AttributeReports.
 /// Format per record: attr_id (u16) | status (u8) | [data_type (u8) | value]
 fn parse_read_attr_rsp(buf: &[u8]) -> Vec<AttributeReport> {
@@ -343,5 +352,15 @@ mod tests {
         let raw = [0x05, 0x99, 0x99, 0x01, 0x07];
         let msg = parse_message(0x0005, &raw, None, None).unwrap().unwrap();
         assert_eq!(msg.values["action"], "manufacturer_0x9999_cmd_0x07");
+    }
+
+    #[test]
+    fn detects_ias_enroll_request() {
+        // cluster-specific, server→client, seq 1, cmd 0x01, zone type 0x000D, mfr 0x0000
+        assert!(is_ias_enroll_request(&[0x19, 0x01, 0x01, 0x0D, 0x00, 0x00, 0x00]));
+        // Zone Status Change Notification is not an enroll request
+        assert!(!is_ias_enroll_request(&[0x19, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00]));
+        // global command 0x01 (Read Attributes Response) is not either
+        assert!(!is_ias_enroll_request(&[0x18, 0x01, 0x01, 0x01, 0x00, 0x00]));
     }
 }

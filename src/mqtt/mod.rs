@@ -338,30 +338,60 @@ async fn subscribe_and_notify(
     }
 }
 
-/// Map an inbound publish on one of our subscribed topics to a bridge command.
+/// Map an inbound publish under `{base_topic}/#` to a bridge command.
+///
+/// Accepts z2m's forms `{name}/set`, `{name}/set/{attribute}`, `{name}/get`
+/// and `{name}/get/{attribute}`, where `name` may itself contain '/'. Our own
+/// state publishes echoed back by the `#` subscription match none of these
+/// and are ignored.
 fn command_from_publish(topic: &str, payload: &[u8], base_topic: &str) -> Option<MqttCommand> {
-    if topic == format!("{base_topic}/bridge/request/permit_join") {
+    let rest = topic.strip_prefix(base_topic)?.strip_prefix('/')?;
+    if rest == "bridge/request/permit_join" {
         let duration = parse_permit_join_payload(payload);
         return Some(MqttCommand::PermitJoin { duration });
     }
-
-    let is_set = topic.ends_with("/set");
-    if !is_set && !topic.ends_with("/get") {
+    if rest.starts_with("bridge/") {
         return None;
     }
-    let suffix = if is_set { "/set" } else { "/get" };
-    let friendly_name = friendly_name_from_topic(topic, base_topic, suffix);
 
-    if !is_set {
+    let segments: Vec<&str> = rest.split('/').collect();
+    let n = segments.len();
+    let (verb_idx, attribute) = if n >= 2 && matches!(segments[n - 1], "set" | "get") {
+        (n - 1, None)
+    } else if n >= 3 && matches!(segments[n - 2], "set" | "get") {
+        (n - 2, Some(segments[n - 1]))
+    } else {
+        return None;
+    };
+    let friendly_name = segments[..verb_idx].join("/");
+    if friendly_name.is_empty() {
+        return None;
+    }
+
+    if segments[verb_idx] == "get" {
         return Some(MqttCommand::GetDevice { friendly_name });
     }
-    // z2m accepts a bare state as well as a JSON object: `ON`, or `"ON"`.
-    let payload = match serde_json::from_slice::<serde_json::Value>(payload) {
-        Ok(serde_json::Value::String(s)) => json!({ "state": s.trim() }),
-        Ok(v) => v,
-        Err(_) => match std::str::from_utf8(payload) {
-            Ok(s) => json!({ "state": s.trim() }),
-            Err(_) => serde_json::Value::Null,
+    let parsed = serde_json::from_slice::<serde_json::Value>(payload);
+    let payload = match attribute {
+        // `{name}/set/brightness` with payload `200` == `{name}/set` with `{"brightness":200}`
+        Some(attr) => {
+            let value = match parsed {
+                Ok(v) => v,
+                Err(_) => match std::str::from_utf8(payload) {
+                    Ok(s) => json!(s.trim()),
+                    Err(_) => return None,
+                },
+            };
+            json!({ attr: value })
+        }
+        // z2m accepts a bare state as well as a JSON object: `ON`, or `"ON"`.
+        None => match parsed {
+            Ok(serde_json::Value::String(s)) => json!({ "state": s.trim() }),
+            Ok(v) => v,
+            Err(_) => match std::str::from_utf8(payload) {
+                Ok(s) => json!({ "state": s.trim() }),
+                Err(_) => serde_json::Value::Null,
+            },
         },
     };
     Some(MqttCommand::SetDevice {
@@ -375,25 +405,12 @@ fn next_backoff(current: Duration) -> Duration {
     (current * 2).min(MQTT_RECONNECT_DELAY_MAX)
 }
 
-/// Extract the friendly name from a "{base_topic}/{friendly_name}/{suffix}" topic.
-/// Subscriptions are always "{base_topic}/+/set" or ".../get", so this always
-/// matches for topics reaching this function; falls back to the raw topic on
-/// any unexpected shape.
-fn friendly_name_from_topic(topic: &str, base_topic: &str, suffix: &str) -> String {
-    topic
-        .strip_prefix(base_topic)
-        .and_then(|s| s.strip_prefix('/'))
-        .and_then(|s| s.strip_suffix(suffix))
-        .unwrap_or(topic)
-        .to_string()
-}
-
 async fn subscribe_topics(client: &AsyncClient, base_topic: &str) -> bool {
-    let set_wildcard = format!("{}/+/set", base_topic);
-    let get_wildcard = format!("{}/+/get", base_topic);
-    let permit_topic = format!("{}/bridge/request/permit_join", base_topic);
+    // Like z2m, subscribe to the whole tree: `+/set` can't match friendly
+    // names containing '/' or the `{name}/set/{attribute}` form.
+    let all = format!("{}/#", base_topic);
 
-    for topic in &[&set_wildcard, &get_wildcard, &permit_topic] {
+    for topic in &[&all] {
         if let Err(e) = client.subscribe(*topic, QoS::AtLeastOnce).await {
             error!("MQTT subscribe error for {topic}: {e}");
             return false;
@@ -480,22 +497,6 @@ mod tests {
         assert_eq!(
             next_backoff(MQTT_RECONNECT_DELAY_MIN),
             MQTT_RECONNECT_DELAY_MIN * 2
-        );
-    }
-
-    #[test]
-    fn friendly_name_from_set_topic() {
-        assert_eq!(
-            friendly_name_from_topic("zigbee2mqtt/kitchen_light/set", "zigbee2mqtt", "/set"),
-            "kitchen_light"
-        );
-    }
-
-    #[test]
-    fn friendly_name_from_get_topic() {
-        assert_eq!(
-            friendly_name_from_topic("zigbee2mqtt/kitchen_light/get", "zigbee2mqtt", "/get"),
-            "kitchen_light"
         );
     }
 
@@ -592,12 +593,49 @@ mod tests {
         );
     }
 
+    fn set_target(topic: &str, payload: &[u8]) -> Option<(String, serde_json::Value)> {
+        match command_from_publish(topic, payload, "zigbee2mqtt") {
+            Some(MqttCommand::SetDevice { friendly_name, payload }) => Some((friendly_name, payload)),
+            _ => None,
+        }
+    }
+
     #[test]
     fn friendly_name_with_nested_path() {
         // z2m allows friendly names containing '/' (e.g. "room/light")
         assert_eq!(
-            friendly_name_from_topic("zigbee2mqtt/room/light/set", "zigbee2mqtt", "/set"),
-            "room/light"
+            set_target("zigbee2mqtt/room/light/set", br#"{"state":"ON"}"#),
+            Some(("room/light".into(), json!({"state": "ON"})))
         );
+        assert!(matches!(
+            command_from_publish("zigbee2mqtt/room/light/get", b"", "zigbee2mqtt"),
+            Some(MqttCommand::GetDevice { friendly_name }) if friendly_name == "room/light"
+        ));
+    }
+
+    #[test]
+    fn set_with_attribute_suffix() {
+        assert_eq!(
+            set_target("zigbee2mqtt/lamp/set/brightness", b"200"),
+            Some(("lamp".into(), json!({"brightness": 200})))
+        );
+        assert_eq!(
+            set_target("zigbee2mqtt/room/lamp/set/state", b"ON"),
+            Some(("room/lamp".into(), json!({"state": "ON"})))
+        );
+    }
+
+    #[test]
+    fn echoed_state_and_bridge_topics_ignored() {
+        for topic in [
+            "zigbee2mqtt/lamp",
+            "zigbee2mqtt/lamp/state",
+            "zigbee2mqtt/bridge/state",
+            "zigbee2mqtt/bridge/devices",
+            "zigbee2mqtt/set",
+            "other/lamp/set",
+        ] {
+            assert!(command_from_publish(topic, b"x", "zigbee2mqtt").is_none(), "{topic}");
+        }
     }
 }

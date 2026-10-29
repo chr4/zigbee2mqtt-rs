@@ -225,7 +225,9 @@ pub fn zdo_startup_from_app(start_delay_ms: u16) -> ZnpFrame {
 
 pub fn zdo_permit_join(dst_addr: u16, duration: u8) -> ZnpFrame {
     let mut data = Vec::new();
-    data.push(0x02); // addr mode: NWK address
+    // Broadcast destinations (0xFFF8..=0xFFFF) need AddrMode Broadcast (0x0F),
+    // as zigpy-znp sends; plain NWK mode (0x02) is for unicast.
+    data.push(if dst_addr >= 0xFFF8 { 0x0F } else { 0x02 });
     data.extend_from_slice(&dst_addr.to_le_bytes());
     data.push(duration);
     data.push(0); // tc_significance
@@ -649,9 +651,10 @@ mod tests {
     #[test]
     fn permit_join_format() {
         let frame = zdo_permit_join(0xFFFC, 254);
-        assert_eq!(frame.data[0], 0x02);
+        assert_eq!(frame.data[0], 0x0F); // broadcast addr mode
         assert_eq!(u16::from_le_bytes([frame.data[1], frame.data[2]]), 0xFFFC);
         assert_eq!(frame.data[3], 254);
+        assert_eq!(zdo_permit_join(0x1234, 60).data[0], 0x02); // unicast: NWK mode
     }
 
     #[test]

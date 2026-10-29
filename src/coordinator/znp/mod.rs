@@ -489,10 +489,14 @@ impl ZnpHandle {
                 dst_addr, dst_ep, 1, cluster_id, trans_id, payload,
             ))
             .await?;
-        if rsp.data.first().copied() != Some(0) {
-            warn!("AF_DATA_REQUEST status: {:?}", rsp.data);
+        // A non-zero status means the frame was never queued for transmission
+        // (e.g. no route / buffer full), so callers must not treat it as sent.
+        match rsp.data.first().copied() {
+            Some(0) => Ok(()),
+            status => Err(Error::Znp(format!(
+                "AF_DATA_REQUEST to 0x{dst_addr:04X} rejected, status {status:02X?}"
+            ))),
         }
-        Ok(())
     }
 }
 
