@@ -23,6 +23,15 @@ pub enum Error {
     #[error("ZNP protocol error: {0}")]
     Znp(String),
 
+    /// The ZNP firmware answered an SREQ with an RPC error (e.g. a command
+    /// this Z-Stack version doesn't implement).
+    #[error("ZNP rejected command sub=0x{subsystem:02X} cmd1=0x{cmd1:02X}: {reason}")]
+    ZnpRejected {
+        subsystem: u8,
+        cmd1: u8,
+        reason: &'static str,
+    },
+
     #[error("ZCL protocol error: {0}")]
     Zcl(String),
 
