@@ -5,13 +5,19 @@
 ///   - `ZnpReceiver` – receive incoming SRSP/AREQ frames
 ///
 /// SREQ/SRSP pairing is handled internally: `request()` sends an SREQ and
-/// waits for the matching SRSP (same cmd0 subsystem bits + cmd1).
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+/// waits for the matching SRSP (same cmd0 subsystem bits + cmd1). Only one
+/// SREQ is outstanding at a time -- the ZNP wire format carries no request
+/// ID, so a second in-flight SREQ of the same shape couldn't be told apart.
+///
+/// Any serial I/O failure, or `MAX_CONSECUTIVE_TIMEOUTS` SREQs in a row going
+/// unanswered, is treated as fatal: the actor exits, which fails all pending
+/// and future requests with `Error::ChannelClosed` and closes the event
+/// channel, so the bridge shuts down and its supervisor restarts it.
 use std::time::Duration;
 
 use futures::SinkExt;
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::Instant;
 use tokio_serial::SerialPortBuilderExt;
 use tokio_stream::StreamExt;
 use tokio_util::codec::Framed;
@@ -21,6 +27,14 @@ use super::frame::{FrameType, Subsystem, ZnpCodec, ZnpFrame};
 use crate::error::{Error, Result};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+// A serial write that doesn't complete in this time means the adapter has
+// stopped draining its USB/UART buffer -- treated as fatal like a write error.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+// SRSPs come from the coordinator itself (not the remote device), so even a
+// ZDO request to a sleeping device is answered promptly. Several timeouts in
+// a row mean the adapter firmware has hung (a known CC2531 failure mode)
+// rather than a one-off glitch.
+const MAX_CONSECUTIVE_TIMEOUTS: u32 = 3;
 // `event_tx` (AREQ events to the bridge) uses try_send and drops on overflow
 // (see dispatch()) rather than blocking the serial read loop -- sized well
 // above typical steady-state traffic so a burst (e.g. many devices reporting
@@ -40,7 +54,9 @@ pub enum ZnpEvent {
     IeeeAddrRsp(Vec<u8>),
     BindRsp(Vec<u8>),
     TcDevInd(Vec<u8>),
-    StateChangeInd,
+    /// ZDO_STATE_CHANGE_IND with the new device state (0x09 = started as
+    /// coordinator).
+    StateChangeInd(u8),
     Other,
 }
 
@@ -49,14 +65,49 @@ enum ActorMsg {
     Send(ZnpFrame),
     Request {
         frame: ZnpFrame,
-        id: u64,
         reply_tx: oneshot::Sender<Result<ZnpFrame>>,
     },
-    /// Sent by the client when a request's timeout elapses, so the actor can
-    /// drop a stale `pending` entry instead of risking it being matched
-    /// against a later request of the same (subsystem, cmd1) shape -- the
-    /// ZNP wire format carries no request ID we could match on directly.
-    Cancel(u64),
+}
+
+// ── SRSP matching ─────────────────────────────────────────────────────────────
+
+/// How an incoming SRSP relates to the outstanding request.
+#[derive(Debug, PartialEq, Eq)]
+enum SrspMatch {
+    /// The SRSP answering the pending request.
+    Reply,
+    /// An RPC error (SRSP, subsystem 0x00, cmd1 0x00) whose embedded request
+    /// header names the pending request -- the firmware rejected it, e.g.
+    /// APP_CNF/BDB commands on Z-Stack Home 1.2. Carries the error code.
+    Rejected(u8),
+    /// Not for the pending request (stale, or unsolicited).
+    Unrelated,
+}
+
+/// Classify `frame` (an SRSP) against a pending request of shape
+/// (`expected_sub`, `expected_cmd1`). RPC error layout per zigpy-znp's
+/// `RPCError.CommandNotRecognized`: ErrorCode(u8) + RequestHeader(cmd0, cmd1).
+fn match_srsp(frame: &ZnpFrame, expected_sub: u8, expected_cmd1: u8) -> SrspMatch {
+    if frame.subsystem as u8 == expected_sub && frame.cmd1 == expected_cmd1 {
+        return SrspMatch::Reply;
+    }
+    if frame.subsystem == Subsystem::Rpc && frame.cmd1 == 0x00 && frame.data.len() >= 3 {
+        let (code, req_cmd0, req_cmd1) = (frame.data[0], frame.data[1], frame.data[2]);
+        if req_cmd0 & 0x1F == expected_sub && req_cmd1 == expected_cmd1 {
+            return SrspMatch::Rejected(code);
+        }
+    }
+    SrspMatch::Unrelated
+}
+
+fn rpc_error_name(code: u8) -> &'static str {
+    match code {
+        0x01 => "invalid subsystem",
+        0x02 => "invalid command id",
+        0x03 => "invalid parameter",
+        0x04 => "invalid length",
+        _ => "unknown error",
+    }
 }
 
 // ── Actor task ────────────────────────────────────────────────────────────────
@@ -66,49 +117,67 @@ struct TransportActor {
     actor_rx: mpsc::Receiver<ActorMsg>,
     event_tx: mpsc::Sender<ZnpEvent>,
     pending: Option<PendingRequest>,
+    consecutive_timeouts: u32,
 }
 
 struct PendingRequest {
-    id: u64,
     expected_sub: u8,
     expected_cmd1: u8,
+    deadline: Instant,
     reply_tx: oneshot::Sender<Result<ZnpFrame>>,
 }
 
 impl TransportActor {
+    /// Runs until the serial port fails or the coordinator stops answering.
+    /// Returning drops `pending`, `actor_rx` and `event_tx`, which fails every
+    /// outstanding/queued request and closes the event channel.
     async fn run(mut self) {
         loop {
+            let deadline = self.pending.as_ref().map(|p| p.deadline);
             tokio::select! {
-                // Outgoing messages from callers
-                msg = self.actor_rx.recv() => {
+                // Outgoing messages from callers. Not read while an SREQ is
+                // outstanding, so requests queue up here in order.
+                msg = self.actor_rx.recv(), if self.pending.is_none() => {
                     match msg {
                         None => break,
                         Some(ActorMsg::Send(frame)) => {
                             trace!(?frame, "→ ZNP send AREQ");
-                            if let Err(e) = self.framed.send(frame).await {
-                                error!("ZNP serial write error: {e}");
+                            if let Err(e) = self.write(frame).await {
+                                error!("ZNP serial write failed, shutting down transport: {e}");
+                                break;
                             }
                         }
-                        Some(ActorMsg::Request { frame, id, reply_tx }) => {
-                            let expected_cmd0 = frame.cmd0();
-                            let cmd1          = frame.cmd1;
+                        Some(ActorMsg::Request { frame, reply_tx }) => {
+                            let expected_sub = frame.cmd0() & 0x1F;
+                            let expected_cmd1 = frame.cmd1;
                             trace!(?frame, "→ ZNP send SREQ");
-                            if let Err(e) = self.framed.send(frame).await {
-                                let _ = reply_tx.send(Err(Error::Io(e)));
-                                continue;
+                            if let Err(e) = self.write(frame).await {
+                                error!("ZNP serial write failed, shutting down transport: {e}");
+                                let _ = reply_tx.send(Err(e));
+                                break;
                             }
                             self.pending = Some(PendingRequest {
-                                id,
-                                expected_sub: expected_cmd0 & 0x1F,
-                                expected_cmd1: cmd1,
+                                expected_sub,
+                                expected_cmd1,
+                                deadline: Instant::now() + REQUEST_TIMEOUT,
                                 reply_tx,
                             });
                         }
-                        Some(ActorMsg::Cancel(id)) => {
-                            if self.pending.as_ref().is_some_and(|p| p.id == id) {
-                                self.pending = None;
-                            }
-                        }
+                    }
+                }
+
+                // SRSP for the outstanding SREQ didn't arrive in time
+                _ = tokio::time::sleep_until(deadline.unwrap_or_else(Instant::now)), if deadline.is_some() => {
+                    let pending = self.pending.take().expect("deadline implies pending");
+                    self.consecutive_timeouts += 1;
+                    warn!(
+                        "ZNP request sub=0x{:02X} cmd1=0x{:02X} timed out ({}/{MAX_CONSECUTIVE_TIMEOUTS} in a row)",
+                        pending.expected_sub, pending.expected_cmd1, self.consecutive_timeouts
+                    );
+                    let _ = pending.reply_tx.send(Err(Error::Timeout));
+                    if self.consecutive_timeouts >= MAX_CONSECUTIVE_TIMEOUTS {
+                        error!("ZNP coordinator stopped responding, shutting down transport");
+                        break;
                     }
                 }
 
@@ -120,7 +189,10 @@ impl TransportActor {
                             break;
                         }
                         Some(Err(e)) => {
-                            error!("ZNP serial read error: {e}");
+                            // tokio-util's Framed ends the stream after any
+                            // read error anyway; stop explicitly.
+                            error!("ZNP serial read error, shutting down transport: {e}");
+                            break;
                         }
                         Some(Ok(f)) => {
                             self.dispatch(f);
@@ -131,34 +203,44 @@ impl TransportActor {
         }
     }
 
+    async fn write(&mut self, frame: ZnpFrame) -> Result<()> {
+        match tokio::time::timeout(WRITE_TIMEOUT, self.framed.send(frame)).await {
+            Ok(res) => res.map_err(Error::Io),
+            Err(_) => Err(Error::Timeout),
+        }
+    }
+
     fn dispatch(&mut self, frame: ZnpFrame) {
         trace!(?frame, "← ZNP recv");
 
         if frame.frame_type == FrameType::SRsp {
-            if let Some(pending) = &self.pending {
-                if frame.subsystem as u8 == pending.expected_sub
-                    && frame.cmd1 == pending.expected_cmd1
-                {
+            let matched = self
+                .pending
+                .as_ref()
+                .map(|p| match_srsp(&frame, p.expected_sub, p.expected_cmd1));
+            match matched {
+                Some(SrspMatch::Reply) => {
+                    self.consecutive_timeouts = 0;
                     let pending = self.pending.take().unwrap();
                     let _ = pending.reply_tx.send(Ok(frame));
-                    return;
                 }
-                // Mismatched subsystem but there's a pending request — deliver it
-                // anyway. Z-Stack 1.2 may return subsystem 0 for errors.
-                if frame.cmd1 == pending.expected_cmd1 {
-                    warn!(
-                        "SRSP subsystem mismatch: expected 0x{:02X} got 0x{:02X}, delivering anyway",
-                        pending.expected_sub, frame.subsystem as u8
-                    );
+                Some(SrspMatch::Rejected(code)) => {
+                    // The coordinator answered, so it's alive.
+                    self.consecutive_timeouts = 0;
                     let pending = self.pending.take().unwrap();
-                    let _ = pending.reply_tx.send(Ok(frame));
-                    return;
+                    let _ = pending.reply_tx.send(Err(Error::ZnpRejected {
+                        subsystem: pending.expected_sub,
+                        cmd1: pending.expected_cmd1,
+                        reason: rpc_error_name(code),
+                    }));
+                }
+                Some(SrspMatch::Unrelated) | None => {
+                    warn!(
+                        "Unexpected SRSP sub=0x{:02X} cmd1=0x{:02X} data={:02X?}",
+                        frame.subsystem as u8, frame.cmd1, frame.data
+                    );
                 }
             }
-            warn!(
-                "Unexpected SRSP sub=0x{:02X} cmd1=0x{:02X}",
-                frame.subsystem as u8, frame.cmd1
-            );
             return;
         }
 
@@ -169,7 +251,9 @@ impl TransportActor {
             (Subsystem::Zdo, 0x84) => ZnpEvent::SimpleDescRsp(frame.data),
             (Subsystem::Zdo, 0x85) => ZnpEvent::ActiveEpRsp(frame.data),
             (Subsystem::Zdo, 0xA1) => ZnpEvent::BindRsp(frame.data),
-            (Subsystem::Zdo, 0xC0) => ZnpEvent::StateChangeInd,
+            (Subsystem::Zdo, 0xC0) => {
+                ZnpEvent::StateChangeInd(frame.data.first().copied().unwrap_or(0))
+            }
             (Subsystem::Zdo, 0xC1) => ZnpEvent::EndDeviceAnnceInd(frame.data),
             (Subsystem::Zdo, 0xC9) => ZnpEvent::LeaveInd(frame.data),
             (Subsystem::Zdo, 0xCA) => ZnpEvent::TcDevInd(frame.data),
@@ -177,6 +261,11 @@ impl TransportActor {
             _ => ZnpEvent::Other,
         };
 
+        // Nothing consumes the catch-all; don't let it (e.g. one
+        // AF_DATA_CONFIRM per command sent) crowd real events out of the queue.
+        if matches!(event, ZnpEvent::Other) {
+            return;
+        }
         if let Err(e) = self.event_tx.try_send(event) {
             warn!("ZNP event queue full, dropping: {e}");
         }
@@ -188,7 +277,6 @@ impl TransportActor {
 #[derive(Clone)]
 pub struct ZnpTransport {
     actor_tx: mpsc::Sender<ActorMsg>,
-    next_id: Arc<AtomicU64>,
 }
 
 impl ZnpTransport {
@@ -207,16 +295,11 @@ impl ZnpTransport {
             actor_rx,
             event_tx,
             pending: None,
+            consecutive_timeouts: 0,
         };
         tokio::spawn(actor.run());
 
-        Ok((
-            Self {
-                actor_tx,
-                next_id: Arc::new(AtomicU64::new(0)),
-            },
-            event_rx,
-        ))
+        Ok((Self { actor_tx }, event_rx))
     }
 
     /// Fire-and-forget AREQ send.
@@ -227,28 +310,70 @@ impl ZnpTransport {
             .map_err(|_| Error::ChannelClosed)
     }
 
-    /// Send SREQ and wait for matching SRSP.
+    /// Send SREQ and wait for matching SRSP. The actor enforces
+    /// `REQUEST_TIMEOUT` (answering `Error::Timeout`); an RPC error from the
+    /// firmware comes back as `Error::ZnpRejected`, and the actor shutting
+    /// down surfaces as `Error::ChannelClosed`.
     pub async fn request(&self, frame: ZnpFrame) -> Result<ZnpFrame> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (reply_tx, reply_rx) = oneshot::channel();
         self.actor_tx
-            .send(ActorMsg::Request {
-                frame,
-                id,
-                reply_tx,
-            })
+            .send(ActorMsg::Request { frame, reply_tx })
             .await
             .map_err(|_| Error::ChannelClosed)?;
+        reply_rx.await.map_err(|_| Error::ChannelClosed)?
+    }
+}
 
-        match tokio::time::timeout(REQUEST_TIMEOUT, reply_rx).await {
-            Ok(result) => result.map_err(|_| Error::ChannelClosed)?,
-            Err(_) => {
-                // Tell the actor to drop `pending` if it's still ours, so a
-                // late SRSP that finally arrives isn't misdelivered to
-                // whichever request comes next with the same (subsystem, cmd1).
-                let _ = self.actor_tx.send(ActorMsg::Cancel(id)).await;
-                Err(Error::Timeout)
-            }
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn srsp(subsystem: Subsystem, cmd1: u8, data: Vec<u8>) -> ZnpFrame {
+        ZnpFrame::new(FrameType::SRsp, subsystem, cmd1, data)
+    }
+
+    #[test]
+    fn matching_srsp_is_reply() {
+        let f = srsp(Subsystem::Af, 0x01, vec![0x00]);
+        assert_eq!(match_srsp(&f, Subsystem::Af as u8, 0x01), SrspMatch::Reply);
+    }
+
+    #[test]
+    fn rpc_error_for_pending_request_is_rejected() {
+        // APP_CNF BDB_SET_CHANNEL (SREQ cmd0=0x2F, cmd1=0x08) rejected as an
+        // invalid subsystem, as Z-Stack Home 1.2 does.
+        let f = srsp(Subsystem::Rpc, 0x00, vec![0x01, 0x2F, 0x08]);
+        assert_eq!(
+            match_srsp(&f, Subsystem::AppCnf as u8, 0x08),
+            SrspMatch::Rejected(0x01)
+        );
+    }
+
+    #[test]
+    fn rpc_error_for_other_request_is_unrelated() {
+        let f = srsp(Subsystem::Rpc, 0x00, vec![0x02, 0x25, 0x01]);
+        assert_eq!(
+            match_srsp(&f, Subsystem::Af as u8, 0x01),
+            SrspMatch::Unrelated
+        );
+    }
+
+    #[test]
+    fn same_cmd1_other_subsystem_is_unrelated() {
+        // ZDO_IEEE_ADDR_REQ's SRSP (cmd1 0x01) must not answer AF_DATA_REQUEST.
+        let f = srsp(Subsystem::Zdo, 0x01, vec![0x00]);
+        assert_eq!(
+            match_srsp(&f, Subsystem::Af as u8, 0x01),
+            SrspMatch::Unrelated
+        );
+    }
+
+    #[test]
+    fn truncated_rpc_error_is_unrelated() {
+        let f = srsp(Subsystem::Rpc, 0x00, vec![0x01]);
+        assert_eq!(
+            match_srsp(&f, Subsystem::AppCnf as u8, 0x08),
+            SrspMatch::Unrelated
+        );
     }
 }
