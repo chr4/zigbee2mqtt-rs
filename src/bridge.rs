@@ -45,6 +45,11 @@ impl Bridge {
         // 2. Apply device configs (friendly names override database)
         self.apply_device_configs();
 
+        // 2b. Restore state.json and keep database.db/state.json up to date
+        let store = Arc::new(crate::persistence::Store::new(&self.config_path));
+        store.load_state(&self.devices);
+        let _saver = store.spawn_saver(Arc::clone(&self.devices));
+
         // 3. Log device summary
         let all = self.devices.all_devices();
         info!(
@@ -381,6 +386,7 @@ impl Bridge {
         if let Err(e) = mqtt.publish_bridge_state(false).await {
             warn!("Failed to publish offline state: {e}");
         }
+        store.save(&self.devices);
         Ok(())
     }
 
