@@ -32,11 +32,17 @@ impl ClusterHandler for BasicCluster {
                 }
                 POWER_SOURCE => {
                     if let Some(v) = r.value.as_f64() {
-                        let source = match v as u8 {
-                            0x01 => "mains",
-                            0x03 => "battery",
-                            0x04 => "dc_source",
-                            _    => "unknown",
+                        // zigbee-herdsman's PowerSource names, as z2m publishes
+                        // them and stores them in database.db. Bit 7 flags a
+                        // secondary battery backup and isn't part of the enum.
+                        let source = match v as u8 & 0x7F {
+                            0x01 => "Mains (single phase)",
+                            0x02 => "Mains (3 phase)",
+                            0x03 => "Battery",
+                            0x04 => "DC Source",
+                            0x05 => "Emergency mains constantly powered",
+                            0x06 => "Emergency mains and transfer switch",
+                            _    => "Unknown",
                         };
                         out.push(("power_source".into(), json!(source)));
                     }

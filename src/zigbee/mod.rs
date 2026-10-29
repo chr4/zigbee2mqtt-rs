@@ -10,7 +10,8 @@ impl IeeeAddr {
     #[must_use]
     pub fn from_hex(s: &str) -> Option<IeeeAddr> {
         let hex = s.trim_start_matches("0x").trim_start_matches("0X");
-        if hex.len() != 16 {
+        // is_ascii: the byte-index slicing below would panic on a multi-byte char.
+        if hex.len() != 16 || !hex.is_ascii() {
             return None;
         }
         let mut bytes = [0u8; 8];

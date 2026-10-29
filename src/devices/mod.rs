@@ -161,13 +161,27 @@ impl DeviceRegistry {
         }
     }
 
+    /// Insert or replace a device. NWK 0x0000 is the coordinator's own
+    /// address, used here as "not yet seen on the network" (config stubs),
+    /// so it's never indexed -- otherwise stubs would clobber each other.
     pub fn add(&self, device: Device) {
         let ieee = device.ieee_addr;
         let nwk = device.nwk_addr;
         let name = device.friendly_name.clone();
-        self.by_nwk.insert(nwk, ieee);
+        if let Some(old) = self.by_ieee.insert(ieee, device) {
+            self.unindex(&old);
+        }
+        if nwk != 0 {
+            self.by_nwk.insert(nwk, ieee);
+        }
         self.by_name.insert(name, ieee);
-        self.by_ieee.insert(ieee, device);
+    }
+
+    /// Drop `dev`'s index entries, but only those still pointing at it -- a
+    /// NWK address may since have been reassigned to another device.
+    fn unindex(&self, dev: &Device) {
+        self.by_nwk.remove_if(&dev.nwk_addr, |_, v| *v == dev.ieee_addr);
+        self.by_name.remove_if(&dev.friendly_name, |_, v| *v == dev.ieee_addr);
     }
 
     pub fn get_by_ieee(
@@ -208,16 +222,17 @@ impl DeviceRegistry {
 
     pub fn remove_by_ieee(&self, addr: &IeeeAddr) {
         if let Some((_, dev)) = self.by_ieee.remove(addr) {
-            self.by_nwk.remove(&dev.nwk_addr);
-            self.by_name.remove(&dev.friendly_name);
+            self.unindex(&dev);
         }
     }
 
     pub fn update_nwk_addr(&self, ieee: &IeeeAddr, new_nwk: NwkAddr) {
         if let Some(mut dev) = self.by_ieee.get_mut(ieee) {
-            self.by_nwk.remove(&dev.nwk_addr);
+            self.by_nwk.remove_if(&dev.nwk_addr, |_, v| v == ieee);
             dev.nwk_addr = new_nwk;
-            self.by_nwk.insert(new_nwk, *ieee);
+            if new_nwk != 0 {
+                self.by_nwk.insert(new_nwk, *ieee);
+            }
         }
     }
 
@@ -226,7 +241,7 @@ impl DeviceRegistry {
     /// `by_name` entry, breaking MQTT set/get lookups for the new name.
     pub fn rename(&self, ieee: &IeeeAddr, new_name: String) {
         if let Some(mut dev) = self.by_ieee.get_mut(ieee) {
-            self.by_name.remove(&dev.friendly_name);
+            self.by_name.remove_if(&dev.friendly_name, |_, v| v == ieee);
             dev.friendly_name = new_name.clone();
             self.by_name.insert(new_name, *ieee);
         }
@@ -302,6 +317,43 @@ mod tests {
         reg.remove_by_ieee(&test_ieee());
         assert!(reg.get_by_ieee(&test_ieee()).is_none());
         assert!(reg.get_by_nwk(0x1234).is_none());
+    }
+
+    #[test]
+    fn config_stubs_with_nwk_zero_not_indexed() {
+        let reg = DeviceRegistry::new();
+        reg.add(Device::new(test_ieee(), 0));
+        reg.add(Device::new(IeeeAddr([9; 8]), 0));
+        assert!(reg.get_by_nwk(0).is_none());
+        reg.update_nwk_addr(&test_ieee(), 0x1234);
+        assert_eq!(reg.get_by_nwk(0x1234).unwrap().ieee_addr, test_ieee());
+    }
+
+    #[test]
+    fn reassigned_nwk_survives_old_owner_update_and_removal() {
+        let reg = DeviceRegistry::new();
+        let other = IeeeAddr([9; 8]);
+        reg.add(Device::new(test_ieee(), 0x1234));
+        // NWK 0x1234 gets reassigned to another device...
+        reg.add(Device::new(other, 0x1234));
+        // ...then the original device rejoins elsewhere, and later leaves.
+        reg.update_nwk_addr(&test_ieee(), 0x5678);
+        reg.remove_by_ieee(&test_ieee());
+        assert_eq!(reg.get_by_nwk(0x1234).unwrap().ieee_addr, other);
+    }
+
+    #[test]
+    fn re_add_replaces_stale_indexes() {
+        let reg = DeviceRegistry::new();
+        let mut dev = Device::new(test_ieee(), 0x1234);
+        dev.friendly_name = "old".into();
+        reg.add(dev);
+        let mut dev = Device::new(test_ieee(), 0x5678);
+        dev.friendly_name = "new".into();
+        reg.add(dev);
+        assert!(reg.get_by_nwk(0x1234).is_none());
+        assert!(reg.find_by_name("old").is_none());
+        assert!(reg.find_by_name("new").is_some());
     }
 
     #[test]
