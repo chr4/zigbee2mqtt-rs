@@ -1,9 +1,12 @@
 /// The main bridge -- ties coordinator, MQTT, device registry, and ZCL together.
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::json;
 use tokio::sync::Mutex;
+use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 
 use std::path::PathBuf;
@@ -13,7 +16,7 @@ use crate::coordinator::znp::ZnpHandle;
 use crate::coordinator::{open_coordinator, CoordinatorEvent, CoordinatorHandle};
 use crate::database;
 use crate::devices::{Device, DeviceRegistry};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::homeassistant;
 use crate::mqtt::attribute_output::flatten_attribute_output;
 use crate::mqtt::{MqttBridge, MqttCommand};
@@ -22,6 +25,34 @@ use crate::zigbee::zcl::clusters::color;
 use crate::zigbee::zcl::clusters::level;
 use crate::zigbee::zcl::clusters::on_off;
 use crate::zigbee::{EndpointDesc, IeeeAddr};
+
+/// How often the main loop runs housekeeping (permit-join refresh/expiry,
+/// stalled-interview completion, rate-limiter pruning).
+const HOUSEKEEPING_INTERVAL: Duration = Duration::from_secs(10);
+
+/// An interview waiting on SimpleDescRsps is completed with whatever
+/// endpoints arrived once this long has passed since the last ActiveEpRsp,
+/// so one lost descriptor can't leave a device uninterviewed forever.
+const INTERVIEW_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Minimum gap between ZDO_IEEE_ADDR_REQs for the same unknown NWK address,
+/// so a chatty device we can't identify yet doesn't flood the coordinator.
+const IEEE_LOOKUP_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Maximum permit-join duration the coordinator accepts in one request.
+const PERMIT_JOIN_MAX: u8 = 254;
+
+/// With `permit_join: true` in config, permit join is re-sent once this
+/// little of the previous 254 s window is left. Mirrors zigbee-herdsman
+/// re-sending every ~200 s (unverified -- from memory, not checked against
+/// the herdsman source).
+const PERMIT_JOIN_REFRESH_MARGIN: Duration = Duration::from_secs(54);
+
+/// Output clusters bound to the coordinator after interview. Only command-
+/// emitting clusters remote controls/switches use: binding *every* output
+/// cluster (OTA, Time, Basic, ...) wastes the device's small binding table
+/// and makes it unicast traffic we never handle.
+const BINDABLE_OUTPUT_CLUSTERS: [u16; 4] = [0x0005, 0x0006, 0x0008, 0x0300];
 
 pub struct Bridge {
     cfg: Config,
@@ -73,14 +104,21 @@ impl Bridge {
         let mut coord = open_coordinator(&self.cfg).await?;
         info!("Coordinator ready");
 
-        // 6. Publish retained MQTT state
-        self.republish_mqtt_state(&mqtt, &coord).await;
-
-        // 7. Permit join if configured
+        // 6. Permit join: enable if configured, otherwise explicitly disable --
+        //    don't rely on whatever the coordinator's firmware defaults to.
+        let mut permit_join = PermitJoin::default();
         if self.cfg.permit_join {
-            coord.permit_join(254).await?;
-            info!("Permit join enabled (254 s)");
+            coord.permit_join(PERMIT_JOIN_MAX).await?;
+            permit_join.on_sent(PERMIT_JOIN_MAX, Instant::now());
+            permit_join.keep_enabled = true;
+            info!("Permit join enabled (kept open while permit_join: true)");
+        } else if let Err(e) = coord.permit_join(0).await {
+            warn!("Failed to disable permit join: {e}");
         }
+
+        // 7. Publish retained MQTT state
+        self.republish_mqtt_state(&mqtt, &coord, permit_join.enabled(Instant::now()))
+            .await;
         info!("Startup complete, entering main loop");
 
         let devices = Arc::clone(&self.devices);
@@ -89,17 +127,27 @@ impl Bridge {
         let device_configs = self.cfg.devices.clone();
         let coordinator_ieee = coord.info.ieee_addr.map(|a| a.as_hex()).unwrap_or_default();
 
-        // 7. Main event loop
-        let mut trans_id: u8 = 0;
+        // 8. Main event loop
+        let trans_id = Arc::new(AtomicU8::new(0));
+        let mut interviews = InterviewTracker::default();
+        let mut ieee_lookups = LookupLimiter::default();
+        let mut housekeeping = tokio::time::interval(HOUSEKEEPING_INTERVAL);
+        housekeeping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let shutdown = shutdown_signal();
+        tokio::pin!(shutdown);
 
-        loop {
+        let result: Result<()> = loop {
             tokio::select! {
                 // -- Coordinator events --
                 event = coord.events.recv() => {
                     match event {
                         None => {
+                            // The coordinator layer closes this channel on any
+                            // fatal condition (serial error, unexpected reset,
+                            // unresponsive adapter). Exit non-zero so the
+                            // service manager restarts and re-initialises us.
                             error!("Coordinator event channel closed");
-                            break;
+                            break Err(Error::Znp("coordinator connection lost".into()));
                         }
                         Some(CoordinatorEvent::DeviceJoined { ieee_addr, nwk_addr }) => {
                             let ieee = ieee_addr;
@@ -128,6 +176,9 @@ impl Bridge {
                         Some(CoordinatorEvent::DeviceLeft { ieee_addr, .. }) => {
                             let ieee = ieee_addr;
                             info!("Device left: {ieee}");
+                            if let Some(nwk_addr) = devices.get_by_ieee(&ieee).map(|d| d.nwk_addr) {
+                                interviews.forget(nwk_addr);
+                            }
                             devices.remove_by_ieee(&ieee);
                             if let Err(e) = mqtt.publish_bridge_log("info", &format!("Device left: {ieee}")).await {
                                 warn!("Failed to publish bridge log: {e}");
@@ -150,6 +201,7 @@ impl Bridge {
                                     if let Some(ref name) = cfg.friendly_name {
                                         dev.friendly_name = name.clone();
                                     }
+                                    dev.disabled = cfg.disabled.unwrap_or(false);
                                 }
                                 devices.add(dev);
                             }
@@ -162,11 +214,8 @@ impl Bridge {
 
                         Some(CoordinatorEvent::ActiveEpRsp { nwk_addr, endpoints }) => {
                             debug!("Active EPs for 0x{nwk_addr:04X}: {endpoints:?}");
-                            for ep in endpoints {
-                                if let Err(e) = coord.request_simple_desc(nwk_addr, ep).await {
-                                    warn!("Failed to request simple descriptor: {e}");
-                                }
-                            }
+                            let missing = interviews.expect(nwk_addr, &endpoints, Instant::now());
+                            Self::spawn_simple_desc_requests(Arc::clone(&coord.inner), nwk_addr, missing);
                         }
 
                         Some(CoordinatorEvent::BindRsp { nwk_addr, status }) => {
@@ -186,94 +235,38 @@ impl Bridge {
                                 endpoint,
                                 profile_id,
                                 device_id,
-                                input_clusters: input_clusters.clone(),
-                                output_clusters: output_clusters.clone(),
+                                input_clusters,
+                                output_clusters,
                             };
 
-                            let mut interview_just_completed = false;
                             let mut src_ieee: Option<IeeeAddr> = None;
                             if let Some(mut dev) = devices.get_mut_by_nwk(nwk_addr) {
                                 dev.endpoints.retain(|e| e.endpoint != endpoint);
-                                dev.endpoints.push(ep_desc);
-                                if !dev.interview_complete && !dev.endpoints.is_empty() {
-                                    dev.interview_complete = true;
-                                    interview_just_completed = true;
-                                    info!("Interview complete for {}", dev.display_name());
-                                }
+                                dev.endpoints.push(ep_desc.clone());
                                 src_ieee = Some(dev.ieee_addr);
                             }
 
-                            // Bind this endpoint's output clusters to the coordinator so
-                            // devices whose relevant clusters are *output* clusters (e.g.
-                            // remote controls -- button presses are genOnOff/genLevelCtrl/
-                            // genScenes commands) have somewhere to unicast their commands.
-                            // Without this, such devices join fine but produce no Zigbee
-                            // traffic at all when used.
-                            if let Some(dst_ieee) = coord.info.ieee_addr {
-                                if let Some(src_ieee) = src_ieee {
-                                    for &cluster_id in &output_clusters {
-                                        if let Err(e) = coord
-                                            .request_bind(nwk_addr, src_ieee.0, endpoint, cluster_id, dst_ieee.0, 1)
-                                            .await
-                                        {
-                                            warn!("Failed to request bind for 0x{nwk_addr:04X} ep={endpoint} cluster=0x{cluster_id:04X}: {e}");
-                                        }
-                                    }
-                                }
-                            } else if !output_clusters.is_empty() {
-                                warn!("Cannot bind 0x{nwk_addr:04X} ep={endpoint}: coordinator IEEE address unknown");
+                            // Only complete the interview once every endpoint
+                            // from ActiveEpRsp has been described, so HA
+                            // discovery isn't published from a partial set.
+                            if interviews.record(nwk_addr, endpoint) {
+                                Self::complete_interview(
+                                    &devices, &mqtt, nwk_addr, ha_enabled, &base_topic, &coordinator_ieee,
+                                ).await;
                             }
 
-                            // Request basic cluster attributes (manufacturer, model)
-                            if input_clusters.contains(&0x0000) {
-                                trans_id = trans_id.wrapping_add(1);
-                                let payload = crate::zigbee::zcl::frame::read_attributes_payload(
-                                    trans_id,
-                                    &[0x0004, 0x0005, 0x0007, 0x4000],
+                            if let Some(src_ieee) = src_ieee {
+                                Self::spawn_endpoint_setup(
+                                    Arc::clone(&coord.inner),
+                                    Arc::clone(&trans_id),
+                                    nwk_addr,
+                                    src_ieee,
+                                    coord.info.ieee_addr,
+                                    ep_desc,
                                 );
-                                if let Err(e) = coord.send_zcl(nwk_addr, endpoint, 0x0000, trans_id, payload).await {
-                                    warn!("Failed to send ZCL read attributes: {e}");
-                                }
-                            }
-
-                            // Request IAS Zone ZoneType, so zone status reports can be
-                            // classified correctly (contact/occupancy/smoke/water_leak/...)
-                            // instead of always assumed to be a door/contact sensor.
-                            if input_clusters.contains(&0x0500) {
-                                trans_id = trans_id.wrapping_add(1);
-                                let payload = crate::zigbee::zcl::frame::read_attributes_payload(
-                                    trans_id,
-                                    &[0x0001],
-                                );
-                                if let Err(e) = coord.send_zcl(nwk_addr, endpoint, 0x0500, trans_id, payload).await {
-                                    warn!("Failed to send ZCL read attributes (IAS Zone type): {e}");
-                                }
-                            }
-
-                            // Request Power Configuration battery attributes, so the
-                            // battery/battery_voltage state keys (and the HA battery
-                            // sensor discovered for this device) actually get a value
-                            // instead of waiting on an unsolicited report that most
-                            // devices never send without being asked.
-                            if input_clusters.contains(&0x0001) {
-                                trans_id = trans_id.wrapping_add(1);
-                                let payload = crate::zigbee::zcl::frame::read_attributes_payload(
-                                    trans_id,
-                                    &[0x0020, 0x0021],
-                                );
-                                if let Err(e) = coord.send_zcl(nwk_addr, endpoint, 0x0001, trans_id, payload).await {
-                                    warn!("Failed to send ZCL read attributes (Power Configuration): {e}");
-                                }
                             }
 
                             Self::publish_device_list_static(&devices, &mqtt).await;
-
-                            // Publish HA discovery after interview
-                            if ha_enabled && interview_just_completed {
-                                if let Some(dev) = devices.get_by_nwk(nwk_addr) {
-                                    homeassistant::publish_discovery(&mqtt, &dev, &base_topic, &coordinator_ieee).await;
-                                }
-                            }
                         }
 
                         Some(CoordinatorEvent::Message {
@@ -282,11 +275,11 @@ impl Bridge {
                             debug!("AF msg from 0x{src_addr:04X} ep={src_ep} cluster=0x{cluster_id:04X} lqi={link_quality}");
 
                             // Unknown NWK? Request IEEE address to link it.
-                            if devices.get_by_nwk(src_addr).is_none() {
+                            if devices.get_by_nwk(src_addr).is_none()
+                                && ieee_lookups.allow(src_addr, Instant::now())
+                            {
                                 debug!("Unknown NWK 0x{src_addr:04X}, requesting IEEE address");
-                                if let Err(e) = coord.request_ieee_addr(src_addr).await {
-                                    warn!("Failed to request IEEE address: {e}");
-                                }
+                                Self::spawn_ieee_lookup(Arc::clone(&coord.inner), src_addr);
                             }
 
                             if cluster_id == 0x0000 {
@@ -343,15 +336,30 @@ impl Bridge {
                 // -- MQTT commands --
                 cmd = mqtt_rx.recv() => {
                     match cmd {
-                        None => break,
+                        None => {
+                            error!("MQTT command channel closed");
+                            break Err(Error::ChannelClosed);
+                        }
                         Some(MqttCommand::Connected) => {
                             info!("MQTT session restored, republishing retained state");
-                            self.republish_mqtt_state(&mqtt, &coord).await;
+                            self.republish_mqtt_state(&mqtt, &coord, permit_join.enabled(Instant::now()))
+                                .await;
                         }
                         Some(MqttCommand::PermitJoin { duration }) => {
                             info!("Permit join: {duration}s");
-                            if let Err(e) = coord.permit_join(duration).await {
-                                warn!("Failed to set permit join: {e}");
+                            match coord.permit_join(duration).await {
+                                Ok(()) => {
+                                    permit_join.on_sent(duration, Instant::now());
+                                    // An explicit disable also stops the config-driven
+                                    // keep-open refresh; otherwise it'd re-enable itself
+                                    // within a minute.
+                                    if duration == 0 {
+                                        permit_join.keep_enabled = false;
+                                    }
+                                    self.publish_bridge_info(&mqtt, &coord, permit_join.enabled(Instant::now()))
+                                        .await;
+                                }
+                                Err(e) => warn!("Failed to set permit join: {e}"),
                             }
                             if let Err(e) = mqtt.publish_bridge_log("info", &format!("Permit join: {duration}s")).await {
                                 warn!("Failed to publish bridge log: {e}");
@@ -360,7 +368,7 @@ impl Bridge {
                         Some(MqttCommand::SetDevice { friendly_name, payload }) => {
                             info!("MQTT set: {friendly_name} -> {payload}");
                             Self::handle_set(
-                                &devices, &coord, &mqtt, self.cfg.advanced.output, &mut trans_id,
+                                &devices, &coord, &mqtt, self.cfg.advanced.output, &trans_id,
                                 &friendly_name, &payload,
                             ).await;
                         }
@@ -375,13 +383,54 @@ impl Bridge {
                         }
                     }
                 }
+
+                // -- Housekeeping --
+                _ = housekeeping.tick() => {
+                    let now = Instant::now();
+
+                    if permit_join.needs_refresh(now) {
+                        let was_enabled = permit_join.enabled(now);
+                        match coord.permit_join(PERMIT_JOIN_MAX).await {
+                            Ok(()) => {
+                                permit_join.on_sent(PERMIT_JOIN_MAX, now);
+                                if !was_enabled {
+                                    self.publish_bridge_info(&mqtt, &coord, true).await;
+                                }
+                            }
+                            Err(e) => warn!("Failed to refresh permit join: {e}"),
+                        }
+                    }
+                    if permit_join.take_expired(now) {
+                        info!("Permit join expired");
+                        self.publish_bridge_info(&mqtt, &coord, false).await;
+                    }
+
+                    let stalled = interviews.expire(now);
+                    for &nwk_addr in &stalled {
+                        warn!("Interview for 0x{nwk_addr:04X} timed out waiting for some endpoints, completing with those received");
+                        Self::complete_interview(
+                            &devices, &mqtt, nwk_addr, ha_enabled, &base_topic, &coordinator_ieee,
+                        ).await;
+                    }
+                    if !stalled.is_empty() {
+                        Self::publish_device_list_static(&devices, &mqtt).await;
+                    }
+
+                    ieee_lookups.prune(now);
+                }
+
+                // -- Shutdown --
+                _ = &mut shutdown => {
+                    info!("Shutdown signal received");
+                    break Ok(());
+                }
             }
-        }
+        };
 
         if let Err(e) = mqtt.publish_bridge_state(false).await {
             warn!("Failed to publish offline state: {e}");
         }
-        Ok(())
+        result
     }
 
     /// Import devices from an existing zigbee2mqtt database.db file.
@@ -417,7 +466,12 @@ impl Bridge {
         }
     }
 
-    async fn publish_bridge_info(&self, mqtt: &MqttBridge, coord: &CoordinatorHandle) {
+    async fn publish_bridge_info(
+        &self,
+        mqtt: &MqttBridge,
+        coord: &CoordinatorHandle,
+        permit_join: bool,
+    ) {
         let coord_ieee = coord.info.ieee_addr.map(|a| a.as_hex()).unwrap_or_default();
 
         let info = json!({
@@ -431,7 +485,7 @@ impl Bridge {
                 }
             },
             "log_level": self.cfg.advanced.log_level,
-            "permit_join": self.cfg.permit_join,
+            "permit_join": permit_join,
             "config": {},
         });
 
@@ -440,18 +494,28 @@ impl Bridge {
         }
     }
 
-    async fn republish_mqtt_state(&self, mqtt: &MqttBridge, coord: &CoordinatorHandle) {
+    async fn republish_mqtt_state(
+        &self,
+        mqtt: &MqttBridge,
+        coord: &CoordinatorHandle,
+        permit_join: bool,
+    ) {
         if let Err(e) = mqtt.publish_bridge_state(true).await {
             warn!("Failed to publish online state: {e}");
         }
 
-        self.publish_bridge_info(mqtt, coord).await;
+        self.publish_bridge_info(mqtt, coord, permit_join).await;
 
         let coordinator_ieee_str = coord.info.ieee_addr.map(|a| a.as_hex()).unwrap_or_default();
 
         for dev in self.devices.all_devices() {
-            let state = serde_json::Value::Object(dev.state.clone());
-            Self::publish_state(mqtt, self.cfg.advanced.output, &dev.friendly_name, &state).await;
+            // Nothing known yet (e.g. just after a restart): publishing `{}`
+            // retained would wipe the broker's last real state for HA.
+            if !dev.state.is_empty() {
+                let state = serde_json::Value::Object(dev.state.clone());
+                Self::publish_state(mqtt, self.cfg.advanced.output, &dev.friendly_name, &state)
+                    .await;
+            }
 
             if self.cfg.homeassistant && dev.interview_complete {
                 homeassistant::publish_discovery(
@@ -472,7 +536,7 @@ impl Bridge {
         coord: &CoordinatorHandle,
         mqtt: &MqttBridge,
         output: OutputMode,
-        trans_id: &mut u8,
+        trans_id: &AtomicU8,
         name: &str,
         payload: &serde_json::Value,
     ) {
@@ -494,23 +558,25 @@ impl Bridge {
 
         let nwk_addr = dev.nwk_addr;
         let endpoints = dev.endpoints.clone();
+        let current_state = dev.state.get("state").and_then(|v| v.as_str());
 
-        // Build optimistic state from the command payload
+        // Build optimistic state from the command payload. Only commands the
+        // coordinator actually accepted contribute to it.
         let mut optimistic = serde_json::Map::new();
 
         // Handle state (on/off)
         if let Some(state_val) = payload.get("state") {
             let state_str = state_val.as_str().unwrap_or("");
             if let Some(ep) = find_ep_with_cluster(&endpoints, 0x0006) {
-                if let Some(zcl_payload) = on_off::set_state_payload(*trans_id, state_str) {
-                    *trans_id = trans_id.wrapping_add(1);
-                    if let Err(e) = coord
-                        .send_zcl(nwk_addr, ep, 0x0006, *trans_id, zcl_payload)
+                let tid = next_trans_id(trans_id);
+                if let Some(zcl_payload) = on_off::set_state_payload(tid, state_str) {
+                    if Self::send_command(coord, nwk_addr, ep, 0x0006, tid, zcl_payload, "on/off")
                         .await
                     {
-                        warn!("Failed to send on/off command: {e}");
+                        if let Some(s) = optimistic_on_off(state_str, current_state) {
+                            optimistic.insert("state".into(), json!(s));
+                        }
                     }
-                    optimistic.insert("state".into(), json!(state_str.to_uppercase()));
                 }
             }
         }
@@ -520,18 +586,17 @@ impl Bridge {
             if let Some(ep) = find_ep_with_cluster(&endpoints, 0x0008) {
                 let lvl = brightness.min(254) as u8;
                 let transition = transition_time(payload);
-                let zcl_payload = level::move_to_level_payload(*trans_id, lvl, transition);
-                *trans_id = trans_id.wrapping_add(1);
-                if let Err(e) = coord
-                    .send_zcl(nwk_addr, ep, 0x0008, *trans_id, zcl_payload)
-                    .await
+                let tid = next_trans_id(trans_id);
+                let zcl_payload = level::move_to_level_payload(tid, lvl, transition);
+                if Self::send_command(coord, nwk_addr, ep, 0x0008, tid, zcl_payload, "level").await
                 {
-                    warn!("Failed to send level command: {e}");
-                }
-                optimistic.insert("brightness".into(), json!(lvl));
-                // Move-to-level-with-on/off implies state ON
-                if !optimistic.contains_key("state") {
-                    optimistic.insert("state".into(), json!("ON"));
+                    optimistic.insert("brightness".into(), json!(lvl));
+                    // Move-to-level-with-on/off: level 0 turns the light off,
+                    // anything else turns it on.
+                    if !optimistic.contains_key("state") {
+                        optimistic
+                            .insert("state".into(), json!(if lvl == 0 { "OFF" } else { "ON" }));
+                    }
                 }
             }
         }
@@ -539,18 +604,16 @@ impl Bridge {
         // Handle color_temp
         if let Some(ct) = payload.get("color_temp").and_then(|v| v.as_u64()) {
             if let Some(ep) = find_ep_with_cluster(&endpoints, 0x0300) {
+                let ct = ct.min(u64::from(u16::MAX)) as u16;
                 let transition = transition_time(payload);
-                let zcl_payload =
-                    color::move_to_color_temp_payload(*trans_id, ct as u16, transition);
-                *trans_id = trans_id.wrapping_add(1);
-                if let Err(e) = coord
-                    .send_zcl(nwk_addr, ep, 0x0300, *trans_id, zcl_payload)
+                let tid = next_trans_id(trans_id);
+                let zcl_payload = color::move_to_color_temp_payload(tid, ct, transition);
+                if Self::send_command(coord, nwk_addr, ep, 0x0300, tid, zcl_payload, "color temp")
                     .await
                 {
-                    warn!("Failed to send color temp command: {e}");
+                    optimistic.insert("color_temp".into(), json!(ct));
+                    optimistic.insert("color_mode".into(), json!("color_temp"));
                 }
-                optimistic.insert("color_temp".into(), json!(ct));
-                optimistic.insert("color_mode".into(), json!("color_temp"));
             }
         }
 
@@ -563,48 +626,69 @@ impl Bridge {
                     color_obj.get("x").and_then(|v| v.as_f64()),
                     color_obj.get("y").and_then(|v| v.as_f64()),
                 ) {
-                    let zcl_payload = color::move_to_color_xy_payload(*trans_id, x, y, transition);
-                    *trans_id = trans_id.wrapping_add(1);
-                    if let Err(e) = coord
-                        .send_zcl(nwk_addr, ep, 0x0300, *trans_id, zcl_payload)
+                    let tid = next_trans_id(trans_id);
+                    let zcl_payload = color::move_to_color_xy_payload(tid, x, y, transition);
+                    if Self::send_command(coord, nwk_addr, ep, 0x0300, tid, zcl_payload, "color XY")
                         .await
                     {
-                        warn!("Failed to send color XY command: {e}");
+                        optimistic.insert("color".into(), json!({"x": x, "y": y}));
+                        optimistic.insert("color_mode".into(), json!("xy"));
                     }
-                    optimistic.insert("color".into(), json!({"x": x, "y": y}));
-                    optimistic.insert("color_mode".into(), json!("xy"));
                 } else if let (Some(h), Some(s)) = (
                     color_obj.get("hue").and_then(|v| v.as_f64()),
                     color_obj.get("saturation").and_then(|v| v.as_f64()),
                 ) {
-                    let zcl_hue = ((h / 360.0) * 254.0).round() as u8;
-                    let zcl_sat = ((s / 100.0) * 254.0).round() as u8;
+                    let zcl_hue = ((h.rem_euclid(360.0) / 360.0) * 254.0).round() as u8;
+                    let zcl_sat = ((s.clamp(0.0, 100.0) / 100.0) * 254.0).round() as u8;
+                    let tid = next_trans_id(trans_id);
                     let zcl_payload =
-                        color::move_to_hue_sat_payload(*trans_id, zcl_hue, zcl_sat, transition);
-                    *trans_id = trans_id.wrapping_add(1);
-                    if let Err(e) = coord
-                        .send_zcl(nwk_addr, ep, 0x0300, *trans_id, zcl_payload)
+                        color::move_to_hue_sat_payload(tid, zcl_hue, zcl_sat, transition);
+                    if Self::send_command(coord, nwk_addr, ep, 0x0300, tid, zcl_payload, "color HS")
                         .await
                     {
-                        warn!("Failed to send color HS command: {e}");
+                        optimistic.insert("color".into(), json!({"hue": h, "saturation": s}));
+                        optimistic.insert("color_mode".into(), json!("hs"));
                     }
-                    optimistic.insert("color".into(), json!({"hue": h, "saturation": s}));
-                    optimistic.insert("color_mode".into(), json!("hs"));
                 }
             }
         }
 
-        // Publish optimistic state immediately (z2m behavior)
+        // Publish optimistic state immediately (z2m behavior). `last_seen` is
+        // left alone: it tracks traffic *from* the device, not commands to it.
         if !optimistic.is_empty() {
             // Merge with existing device state
             if let Some(mut dev) = devices.get_mut_by_nwk(nwk_addr) {
                 dev.merge_state(optimistic.clone());
-                dev.state.insert("last_seen".into(), json!(now_iso8601()));
             }
             // Publish the full merged state
             if let Some(dev) = devices.find_by_name(name) {
                 let full_state = serde_json::Value::Object(dev.state);
                 Self::publish_state(mqtt, output, name, &full_state).await;
+            }
+        }
+    }
+
+    /// Send one ZCL command for `handle_set`, using `trans_id` as both the ZCL
+    /// sequence number (already baked into `payload`) and the AF transaction
+    /// ID. Returns whether the coordinator accepted it.
+    #[allow(clippy::too_many_arguments)]
+    async fn send_command(
+        coord: &CoordinatorHandle,
+        nwk_addr: u16,
+        ep: u8,
+        cluster_id: u16,
+        trans_id: u8,
+        payload: Vec<u8>,
+        what: &str,
+    ) -> bool {
+        match coord
+            .send_zcl(nwk_addr, ep, cluster_id, trans_id, payload)
+            .await
+        {
+            Ok(()) => true,
+            Err(e) => {
+                warn!("Failed to send {what} command: {e}");
+                false
             }
         }
     }
@@ -780,6 +864,326 @@ impl Bridge {
                  next join/announce."
             );
         });
+    }
+
+    /// Request simple descriptors for `endpoints` off the main loop: each is
+    /// a coordinator round-trip (up to the 10 s SRSP timeout if the adapter
+    /// is struggling), and the main loop must keep draining events meanwhile.
+    fn spawn_simple_desc_requests(znp: Arc<Mutex<ZnpHandle>>, nwk_addr: u16, endpoints: Vec<u8>) {
+        if endpoints.is_empty() {
+            return;
+        }
+        tokio::spawn(async move {
+            for ep in endpoints {
+                if let Err(e) = znp.lock().await.request_simple_desc(nwk_addr, ep).await {
+                    warn!("Failed to request simple descriptor for 0x{nwk_addr:04X} ep={ep}: {e}");
+                }
+            }
+        });
+    }
+
+    /// Resolve an unknown NWK address to its IEEE address off the main loop.
+    /// The answer arrives as a `CoordinatorEvent::AddressResolved`.
+    fn spawn_ieee_lookup(znp: Arc<Mutex<ZnpHandle>>, nwk_addr: u16) {
+        tokio::spawn(async move {
+            if let Err(e) = znp.lock().await.request_ieee_addr(nwk_addr).await {
+                warn!("Failed to request IEEE address for 0x{nwk_addr:04X}: {e}");
+            }
+        });
+    }
+
+    /// Per-endpoint setup after its simple descriptor arrived, off the main
+    /// loop: bind command-emitting output clusters to the coordinator, and
+    /// read the attributes needed to describe the device.
+    ///
+    /// Binding matters for devices whose relevant clusters are *output*
+    /// clusters (e.g. remote controls -- button presses are genOnOff/
+    /// genLevelCtrl/genScenes commands): without a binding to unicast to,
+    /// such devices join fine but produce no Zigbee traffic at all when used.
+    fn spawn_endpoint_setup(
+        znp: Arc<Mutex<ZnpHandle>>,
+        trans_id: Arc<AtomicU8>,
+        nwk_addr: u16,
+        src_ieee: IeeeAddr,
+        coordinator_ieee: Option<IeeeAddr>,
+        ep: EndpointDesc,
+    ) {
+        tokio::spawn(async move {
+            let endpoint = ep.endpoint;
+            let bindable: Vec<u16> = ep
+                .output_clusters
+                .iter()
+                .copied()
+                .filter(|c| BINDABLE_OUTPUT_CLUSTERS.contains(c))
+                .collect();
+            match coordinator_ieee {
+                Some(dst_ieee) => {
+                    for cluster_id in bindable {
+                        let result = znp
+                            .lock()
+                            .await
+                            .request_bind(nwk_addr, src_ieee.0, endpoint, cluster_id, dst_ieee.0, 1)
+                            .await;
+                        if let Err(e) = result {
+                            warn!("Failed to request bind for 0x{nwk_addr:04X} ep={endpoint} cluster=0x{cluster_id:04X}: {e}");
+                        }
+                    }
+                }
+                None if !bindable.is_empty() => {
+                    warn!("Cannot bind 0x{nwk_addr:04X} ep={endpoint}: coordinator IEEE address unknown");
+                }
+                None => {}
+            }
+
+            // Basic: manufacturer, model, power source, sw build id.
+            // IAS Zone: ZoneType, so zone status reports can be classified
+            //   (contact/occupancy/smoke/water_leak/...) instead of always
+            //   being assumed to be a door/contact sensor.
+            // Power Configuration: battery voltage/percentage, which most
+            //   devices never report unsolicited without being asked.
+            let reads: [(u16, &[u16]); 3] = [
+                (0x0000, &[0x0004, 0x0005, 0x0007, 0x4000]),
+                (0x0500, &[0x0001]),
+                (0x0001, &[0x0020, 0x0021]),
+            ];
+            for (cluster_id, attrs) in reads {
+                if !ep.input_clusters.contains(&cluster_id) {
+                    continue;
+                }
+                let tid = next_trans_id(&trans_id);
+                let payload = crate::zigbee::zcl::frame::read_attributes_payload(tid, attrs);
+                let result = znp
+                    .lock()
+                    .await
+                    .send_zcl(nwk_addr, endpoint, cluster_id, tid, payload)
+                    .await;
+                if let Err(e) = result {
+                    warn!("Failed to send ZCL read attributes (cluster 0x{cluster_id:04X}) to 0x{nwk_addr:04X}: {e}");
+                }
+            }
+        });
+    }
+
+    /// Mark the device at `nwk_addr` interviewed (if it isn't already and has
+    /// at least one described endpoint) and publish its HA discovery.
+    async fn complete_interview(
+        devices: &DeviceRegistry,
+        mqtt: &MqttBridge,
+        nwk_addr: u16,
+        ha_enabled: bool,
+        base_topic: &str,
+        coordinator_ieee: &str,
+    ) {
+        let dev = {
+            let Some(mut dev) = devices.get_mut_by_nwk(nwk_addr) else {
+                return;
+            };
+            if dev.interview_complete || dev.endpoints.is_empty() {
+                return;
+            }
+            dev.interview_complete = true;
+            info!(
+                "Interview complete for {} ({} endpoints)",
+                dev.display_name(),
+                dev.endpoints.len()
+            );
+            dev.clone()
+        };
+        if ha_enabled {
+            homeassistant::publish_discovery(mqtt, &dev, base_topic, coordinator_ieee).await;
+        }
+    }
+}
+
+/// Allocate the next ZCL sequence number / AF transaction ID. Shared between
+/// the main loop and spawned setup tasks, hence atomic.
+fn next_trans_id(counter: &AtomicU8) -> u8 {
+    counter.fetch_add(1, Ordering::Relaxed).wrapping_add(1)
+}
+
+/// The `state` to publish optimistically for an on/off `command`. TOGGLE
+/// inverts the last known state; if that's unknown, publish nothing rather
+/// than guess (the device's own report will follow).
+fn optimistic_on_off(command: &str, current: Option<&str>) -> Option<&'static str> {
+    match command.to_uppercase().as_str() {
+        "ON" | "TRUE" => Some("ON"),
+        "OFF" | "FALSE" => Some("OFF"),
+        "TOGGLE" => match current.map(str::to_uppercase).as_deref() {
+            Some("ON") => Some("OFF"),
+            Some("OFF") => Some("ON"),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Interviews waiting on SimpleDescRsps, keyed by NWK address.
+#[derive(Default)]
+struct InterviewTracker {
+    pending: HashMap<u16, PendingInterview>,
+}
+
+struct PendingInterview {
+    expected: HashSet<u8>,
+    received: HashSet<u8>,
+    /// Time of the latest ActiveEpRsp; the timeout counts from here.
+    started: Instant,
+}
+
+impl InterviewTracker {
+    /// Record an ActiveEpRsp. Returns the endpoints whose simple descriptor
+    /// still needs requesting (a retried ActiveEpRsp only re-requests the
+    /// ones not yet described).
+    fn expect(&mut self, nwk: u16, endpoints: &[u8], now: Instant) -> Vec<u8> {
+        if endpoints.is_empty() {
+            self.pending.remove(&nwk);
+            return Vec::new();
+        }
+        let entry = self.pending.entry(nwk).or_insert_with(|| PendingInterview {
+            expected: HashSet::new(),
+            received: HashSet::new(),
+            started: now,
+        });
+        entry.expected = endpoints.iter().copied().collect();
+        let expected = &entry.expected;
+        entry.received.retain(|ep| expected.contains(ep));
+        entry.started = now;
+        let mut missing = Vec::new();
+        for &ep in endpoints {
+            if !entry.received.contains(&ep) && !missing.contains(&ep) {
+                missing.push(ep);
+            }
+        }
+        missing
+    }
+
+    /// Record a SimpleDescRsp. Returns true once every expected endpoint has
+    /// been described -- or if `nwk` isn't tracked (its ActiveEpRsp was
+    /// never seen), in which case one endpoint is the best we know of.
+    fn record(&mut self, nwk: u16, endpoint: u8) -> bool {
+        let Some(p) = self.pending.get_mut(&nwk) else {
+            return true;
+        };
+        p.received.insert(endpoint);
+        if p.received.is_superset(&p.expected) {
+            self.pending.remove(&nwk);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Drop interviews that have waited longer than `INTERVIEW_TIMEOUT`.
+    /// Returns those that got at least one endpoint, to be completed with
+    /// what arrived.
+    fn expire(&mut self, now: Instant) -> Vec<u16> {
+        let mut stalled = Vec::new();
+        self.pending.retain(|&nwk, p| {
+            if now.duration_since(p.started) < INTERVIEW_TIMEOUT {
+                return true;
+            }
+            if !p.received.is_empty() {
+                stalled.push(nwk);
+            }
+            false
+        });
+        stalled
+    }
+
+    fn forget(&mut self, nwk: u16) {
+        self.pending.remove(&nwk);
+    }
+}
+
+/// Per-NWK rate limiter for unknown-address IEEE lookups.
+#[derive(Default)]
+struct LookupLimiter {
+    last: HashMap<u16, Instant>,
+}
+
+impl LookupLimiter {
+    fn allow(&mut self, nwk: u16, now: Instant) -> bool {
+        match self.last.get(&nwk) {
+            Some(&t) if now.duration_since(t) < IEEE_LOOKUP_INTERVAL => false,
+            _ => {
+                self.last.insert(nwk, now);
+                true
+            }
+        }
+    }
+
+    fn prune(&mut self, now: Instant) {
+        self.last
+            .retain(|_, t| now.duration_since(*t) < IEEE_LOOKUP_INTERVAL);
+    }
+}
+
+/// Actual permit-join state, as last sent to the coordinator.
+#[derive(Default)]
+struct PermitJoin {
+    /// When the current permit-join window closes; `None` when disabled.
+    until: Option<Instant>,
+    /// Keep re-opening the window before it closes (`permit_join: true`).
+    keep_enabled: bool,
+}
+
+impl PermitJoin {
+    fn enabled(&self, now: Instant) -> bool {
+        self.until.is_some_and(|u| now < u)
+    }
+
+    /// Record a successfully sent permit-join request of `duration` seconds.
+    fn on_sent(&mut self, duration: u8, now: Instant) {
+        self.until = (duration > 0).then(|| now + Duration::from_secs(u64::from(duration)));
+    }
+
+    fn needs_refresh(&self, now: Instant) -> bool {
+        self.keep_enabled
+            && self
+                .until
+                .is_none_or(|u| u.saturating_duration_since(now) <= PERMIT_JOIN_REFRESH_MARGIN)
+    }
+
+    /// Clear an elapsed window; returns true exactly once when it closes.
+    fn take_expired(&mut self, now: Instant) -> bool {
+        if self.until.is_some_and(|u| now >= u) {
+            self.until = None;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Resolves on SIGINT or SIGTERM, so the bridge can publish its offline state
+/// on a normal service stop.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(e) => {
+                warn!("Failed to install SIGTERM handler: {e}");
+                ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    ctrl_c().await;
+}
+
+/// Ctrl-C, but never resolving if the handler can't be installed -- an error
+/// there must not look like a shutdown request.
+async fn ctrl_c() {
+    if let Err(e) = tokio::signal::ctrl_c().await {
+        warn!("Failed to install Ctrl-C handler: {e}");
+        std::future::pending::<()>().await;
     }
 }
 
@@ -989,5 +1393,121 @@ mod tests {
         assert_eq!(find_ep_with_cluster(&eps, 0x0006), Some(1));
         assert_eq!(find_ep_with_cluster(&eps, 0x0402), Some(2));
         assert_eq!(find_ep_with_cluster(&eps, 0x9999), None);
+    }
+
+    #[test]
+    fn optimistic_on_off_explicit_states() {
+        assert_eq!(optimistic_on_off("on", None), Some("ON"));
+        assert_eq!(optimistic_on_off("OFF", Some("ON")), Some("OFF"));
+        assert_eq!(optimistic_on_off("true", None), Some("ON"));
+        assert_eq!(optimistic_on_off("blah", Some("ON")), None);
+    }
+
+    #[test]
+    fn optimistic_on_off_toggle_inverts_known_state() {
+        assert_eq!(optimistic_on_off("TOGGLE", Some("ON")), Some("OFF"));
+        assert_eq!(optimistic_on_off("toggle", Some("OFF")), Some("ON"));
+        assert_eq!(optimistic_on_off("TOGGLE", None), None);
+    }
+
+    #[test]
+    fn next_trans_id_wraps_and_is_unique_per_call() {
+        let counter = AtomicU8::new(254);
+        assert_eq!(next_trans_id(&counter), 255);
+        assert_eq!(next_trans_id(&counter), 0);
+        assert_eq!(next_trans_id(&counter), 1);
+    }
+
+    #[test]
+    fn interview_completes_only_after_all_endpoints() {
+        let now = Instant::now();
+        let mut t = InterviewTracker::default();
+        assert_eq!(t.expect(0x1234, &[1, 2], now), vec![1, 2]);
+        assert!(!t.record(0x1234, 1));
+        assert!(t.record(0x1234, 2));
+        // Done -> no longer tracked.
+        assert!(t.expire(now + INTERVIEW_TIMEOUT).is_empty());
+    }
+
+    #[test]
+    fn interview_retry_only_requests_missing_endpoints() {
+        let now = Instant::now();
+        let mut t = InterviewTracker::default();
+        t.expect(0x1234, &[1, 2, 3], now);
+        assert!(!t.record(0x1234, 2));
+        assert_eq!(t.expect(0x1234, &[1, 2, 3], now), vec![1, 3]);
+    }
+
+    #[test]
+    fn untracked_interview_completes_on_first_endpoint() {
+        let mut t = InterviewTracker::default();
+        assert!(t.record(0x4321, 1));
+    }
+
+    #[test]
+    fn stalled_interview_expires_with_partial_endpoints() {
+        let now = Instant::now();
+        let mut t = InterviewTracker::default();
+        t.expect(0x1111, &[1, 2], now);
+        t.record(0x1111, 1);
+        t.expect(0x2222, &[1], now); // nothing received -> dropped, not completed
+        assert!(t.expire(now + Duration::from_secs(1)).is_empty());
+        assert_eq!(t.expire(now + INTERVIEW_TIMEOUT), vec![0x1111]);
+        assert!(t.pending.is_empty());
+    }
+
+    #[test]
+    fn empty_active_ep_rsp_requests_nothing() {
+        let mut t = InterviewTracker::default();
+        assert!(t.expect(0x1234, &[], Instant::now()).is_empty());
+    }
+
+    #[test]
+    fn ieee_lookups_are_rate_limited_per_nwk() {
+        let now = Instant::now();
+        let mut l = LookupLimiter::default();
+        assert!(l.allow(0x1234, now));
+        assert!(!l.allow(0x1234, now + Duration::from_secs(5)));
+        assert!(l.allow(0x5678, now + Duration::from_secs(5)));
+        assert!(l.allow(0x1234, now + IEEE_LOOKUP_INTERVAL));
+        l.prune(now + IEEE_LOOKUP_INTERVAL * 3);
+        assert!(l.last.is_empty());
+    }
+
+    #[test]
+    fn permit_join_timed_window_expires_once() {
+        let now = Instant::now();
+        let mut p = PermitJoin::default();
+        assert!(!p.enabled(now));
+        p.on_sent(60, now);
+        assert!(p.enabled(now + Duration::from_secs(59)));
+        assert!(!p.needs_refresh(now + Duration::from_secs(59)));
+        assert!(!p.take_expired(now + Duration::from_secs(59)));
+        assert!(p.take_expired(now + Duration::from_secs(60)));
+        assert!(!p.take_expired(now + Duration::from_secs(61)));
+        assert!(!p.enabled(now + Duration::from_secs(61)));
+    }
+
+    #[test]
+    fn permit_join_kept_open_refreshes_before_closing() {
+        let now = Instant::now();
+        let mut p = PermitJoin {
+            keep_enabled: true,
+            ..Default::default()
+        };
+        assert!(p.needs_refresh(now));
+        p.on_sent(PERMIT_JOIN_MAX, now);
+        assert!(!p.needs_refresh(now + Duration::from_secs(190)));
+        assert!(p.needs_refresh(now + Duration::from_secs(200)));
+    }
+
+    #[test]
+    fn permit_join_zero_disables() {
+        let now = Instant::now();
+        let mut p = PermitJoin::default();
+        p.on_sent(PERMIT_JOIN_MAX, now);
+        p.on_sent(0, now);
+        assert!(!p.enabled(now));
+        assert!(!p.take_expired(now));
     }
 }
