@@ -2,9 +2,11 @@
 /// Message formats are compatible with zigbee2mqtt for Home Assistant integration.
 pub mod attribute_output;
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
-use rumqttc::{AsyncClient, Event, EventLoop, MqttOptions, Packet, QoS};
+use rumqttc::{AsyncClient, ClientError, Event, EventLoop, MqttOptions, Packet, QoS};
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
@@ -14,6 +16,12 @@ use crate::error::{Error, Result};
 
 const MQTT_RECONNECT_DELAY_MIN: Duration = Duration::from_secs(1);
 const MQTT_RECONNECT_DELAY_MAX: Duration = Duration::from_secs(30);
+// Capacity of rumqttc's request channel (AsyncClient → EventLoop). Only the
+// event loop drains it, and only while connected -- see `MqttBridge::publish`.
+const MQTT_REQUEST_CAPACITY: usize = 64;
+// Upper bound on waiting for room in the request channel while connected,
+// covering a disconnect that races with the `is_connected()` check.
+const MQTT_PUBLISH_TIMEOUT: Duration = Duration::from_secs(5);
 
 // ── Inbound MQTT commands ─────────────────────────────────────────────────────
 
@@ -32,16 +40,50 @@ pub enum MqttCommand {
     },
 }
 
+// ── Link state ────────────────────────────────────────────────────────────────
+
+/// Broker connection state, shared between the bridge (publishing) and the
+/// event loop task (which sees connects/disconnects).
+#[derive(Default)]
+struct LinkState {
+    connected: AtomicBool,
+    /// Publishes dropped since the link last went down.
+    dropped: AtomicU64,
+}
+
+impl LinkState {
+    fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::Relaxed)
+    }
+
+    fn set_disconnected(&self) {
+        self.connected.store(false, Ordering::Relaxed);
+    }
+
+    /// Mark the link up; returns how many publishes were dropped while it was down.
+    fn set_connected(&self) -> u64 {
+        self.connected.store(true, Ordering::Relaxed);
+        self.dropped.swap(0, Ordering::Relaxed)
+    }
+
+    /// Count a dropped publish; true for the first drop of an outage, so the
+    /// caller logs once per outage rather than once per message.
+    fn note_dropped(&self) -> bool {
+        self.dropped.fetch_add(1, Ordering::Relaxed) == 0
+    }
+}
+
 // ── MqttBridge ────────────────────────────────────────────────────────────────
 
 pub struct MqttBridge {
     client: AsyncClient,
     base_topic: String,
+    link: Arc<LinkState>,
 }
 
 impl MqttBridge {
     /// Connect to the broker, subscribe to command topics, and spawn the event loop.
-    pub async fn connect(cfg: &MqttConfig) -> Result<(Self, mpsc::Receiver<MqttCommand>)> {
+    pub async fn connect(cfg: &MqttConfig) -> Result<(Self, mpsc::UnboundedReceiver<MqttCommand>)> {
         let mut opts = MqttOptions::new(&cfg.client_id, &cfg.server, cfg.port);
         opts.set_keep_alive(Duration::from_secs(cfg.keepalive as u64));
         opts.set_clean_session(true);
@@ -60,16 +102,21 @@ impl MqttBridge {
             true,
         ));
 
-        let (client, event_loop) = AsyncClient::new(opts, 64);
-        let (cmd_tx, cmd_rx) = mpsc::channel::<MqttCommand>(64);
+        let (client, event_loop) = AsyncClient::new(opts, MQTT_REQUEST_CAPACITY);
+        // Unbounded: the event loop task must never block on the bridge (see
+        // run_event_loop). Inbound volume is bounded by what the broker sends.
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<MqttCommand>();
         let (connected_tx, connected_rx) = oneshot::channel();
+        let link = Arc::new(LinkState::default());
 
-        let base_topic = cfg.base_topic.clone();
-        let client_clone = client.clone();
-
-        tokio::spawn(async move {
-            run_event_loop(event_loop, client_clone, &base_topic, cmd_tx, connected_tx).await;
-        });
+        tokio::spawn(run_event_loop(
+            event_loop,
+            client.clone(),
+            cfg.base_topic.clone(),
+            cmd_tx,
+            connected_tx,
+            Arc::clone(&link),
+        ));
 
         connected_rx.await.map_err(|_| {
             Error::Config("MQTT event loop exited before initial connection".to_string())
@@ -79,6 +126,7 @@ impl MqttBridge {
             Self {
                 client,
                 base_topic: cfg.base_topic.clone(),
+                link,
             },
             cmd_rx,
         ))
@@ -91,14 +139,14 @@ impl MqttBridge {
         let topic = format!("{}/bridge/state", self.base_topic);
         let state = if online { "online" } else { "offline" };
         let payload = serde_json::to_vec(&json!({"state": state}))?;
-        self.publish_retained(&topic, &payload).await
+        self.publish(&topic, payload, true).await
     }
 
     /// Publish bridge/info (z2m format).
     pub async fn publish_bridge_info(&self, info: &serde_json::Value) -> Result<()> {
         let topic = format!("{}/bridge/info", self.base_topic);
         let payload = serde_json::to_vec(info)?;
-        self.publish_retained(&topic, &payload).await
+        self.publish(&topic, payload, true).await
     }
 
     pub async fn publish_device_state(
@@ -108,7 +156,7 @@ impl MqttBridge {
     ) -> Result<()> {
         let topic = format!("{}/{}", self.base_topic, friendly_name);
         let payload = serde_json::to_vec(state)?;
-        self.publish_retained(&topic, &payload).await
+        self.publish(&topic, payload, true).await
     }
 
     /// Publish one raw attribute value for `advanced.output: attribute`/
@@ -124,13 +172,13 @@ impl MqttBridge {
         value: &str,
     ) -> Result<()> {
         let topic = format!("{}/{}/{}", self.base_topic, friendly_name, key_path);
-        self.publish_retained(&topic, value.as_bytes()).await
+        self.publish(&topic, value.as_bytes().to_vec(), true).await
     }
 
     pub async fn publish_bridge_devices(&self, devices: &serde_json::Value) -> Result<()> {
         let topic = format!("{}/bridge/devices", self.base_topic);
         let payload = serde_json::to_vec(devices)?;
-        self.publish_retained(&topic, &payload).await
+        self.publish(&topic, payload, true).await
     }
 
     /// Publish to bridge/logging (z2m format).
@@ -141,10 +189,7 @@ impl MqttBridge {
             "message": message,
         });
         let bytes = serde_json::to_vec(&payload)?;
-        self.client
-            .publish(&topic, QoS::AtLeastOnce, false, bytes)
-            .await
-            .map_err(Error::Mqtt)
+        self.publish(&topic, bytes, false).await
     }
 
     /// Publish a Home Assistant MQTT discovery config.
@@ -158,33 +203,68 @@ impl MqttBridge {
         let topic = format!("homeassistant/{component}/{node_id}/{object_id}/config");
         tracing::debug!("HA discovery → {topic}");
         let payload = serde_json::to_vec(config)?;
-        self.client
-            .publish(&topic, QoS::AtLeastOnce, true, payload)
-            .await
-            .map_err(|e| {
-                tracing::error!("Failed to publish HA discovery to {topic}: {e}");
-                Error::Mqtt(e)
-            })
+        self.publish(&topic, payload, true).await.map_err(|e| {
+            error!("Failed to publish HA discovery to {topic}: {e}");
+            e
+        })
     }
 
-    async fn publish_retained(&self, topic: &str, payload: &[u8]) -> Result<()> {
-        self.client
-            .publish(topic, QoS::AtLeastOnce, true, payload.to_vec())
-            .await
-            .map_err(Error::Mqtt)
+    /// All publishes go through here. While connected, wait for room in
+    /// rumqttc's request channel (the event loop drains it). While
+    /// disconnected nothing drains it, so waiting would stall the whole bridge
+    /// -- Zigbee processing included -- for the length of the broker outage.
+    /// Instead queue what fits and drop the rest: everything published here is
+    /// either retained state the bridge republishes in full on reconnect
+    /// (`MqttCommand::Connected`) or a transient log line.
+    async fn publish(&self, topic: &str, payload: Vec<u8>, retain: bool) -> Result<()> {
+        if self.link.is_connected() {
+            let send = self
+                .client
+                .publish(topic, QoS::AtLeastOnce, retain, payload);
+            return match tokio::time::timeout(MQTT_PUBLISH_TIMEOUT, send).await {
+                Ok(result) => result.map_err(Error::Mqtt),
+                Err(_) => {
+                    self.note_dropped(topic);
+                    Ok(())
+                }
+            };
+        }
+        match self
+            .client
+            .try_publish(topic, QoS::AtLeastOnce, retain, payload)
+        {
+            Ok(()) => Ok(()),
+            Err(ClientError::TryRequest(_)) => {
+                self.note_dropped(topic);
+                Ok(())
+            }
+            Err(e) => Err(Error::Mqtt(e)),
+        }
+    }
+
+    fn note_dropped(&self, topic: &str) {
+        if self.link.note_dropped() {
+            warn!("MQTT send queue full (broker unreachable?), dropping publishes until reconnect, first: {topic}");
+        }
     }
 }
 
 // ── Event loop task ───────────────────────────────────────────────────────────
 
+/// Drive the rumqttc event loop forever, reconnecting with backoff.
+///
+/// Nothing awaited in here may depend on the bridge task or on rumqttc's
+/// request channel: `poll()` is the only thing that drains that channel, so
+/// e.g. awaiting `client.subscribe()` here after a reconnect, with the channel
+/// already filled by the bridge's publishes, deadlocks both tasks for good.
 async fn run_event_loop(
     mut event_loop: EventLoop,
     client: AsyncClient,
-    base_topic: &str,
-    cmd_tx: mpsc::Sender<MqttCommand>,
+    base_topic: String,
+    cmd_tx: mpsc::UnboundedSender<MqttCommand>,
     connected_tx: oneshot::Sender<()>,
+    link: Arc<LinkState>,
 ) {
-    let mut connected_once = false;
     let mut connected_tx = Some(connected_tx);
     let mut reconnect_delay = MQTT_RECONNECT_DELAY_MIN;
 
@@ -192,53 +272,27 @@ async fn run_event_loop(
         match event_loop.poll().await {
             Ok(Event::Incoming(Packet::ConnAck(_))) => {
                 reconnect_delay = MQTT_RECONNECT_DELAY_MIN;
-                if subscribe_topics(&client, base_topic).await {
-                    if connected_once {
-                        let _ = cmd_tx.send(MqttCommand::Connected).await;
-                    } else {
-                        connected_once = true;
-                        if let Some(tx) = connected_tx.take() {
-                            let _ = tx.send(());
-                        }
-                    }
-                    info!("MQTT connected and subscribed");
+                let dropped = link.set_connected();
+                if dropped > 0 {
+                    warn!("Dropped {dropped} MQTT publishes while disconnected");
                 }
+                info!("MQTT connected");
+                tokio::spawn(subscribe_and_notify(
+                    client.clone(),
+                    base_topic.clone(),
+                    cmd_tx.clone(),
+                    connected_tx.take(),
+                ));
             }
             Ok(Event::Incoming(Packet::Publish(pub_msg))) => {
-                let topic = &pub_msg.topic;
-                let payload = &pub_msg.payload;
-
-                if topic.ends_with("/set") || topic.ends_with("/get") {
-                    let is_set = topic.ends_with("/set");
-                    let suffix = if is_set { "/set" } else { "/get" };
-                    let name = friendly_name_from_topic(topic, base_topic, suffix);
-
-                    let json_value = serde_json::from_slice::<serde_json::Value>(payload)
-                        .unwrap_or_else(|_| {
-                            if let Ok(s) = std::str::from_utf8(payload) {
-                                json!({ "state": s.trim() })
-                            } else {
-                                serde_json::Value::Null
-                            }
-                        });
-
-                    let cmd = if is_set {
-                        MqttCommand::SetDevice {
-                            friendly_name: name,
-                            payload: json_value,
-                        }
-                    } else {
-                        MqttCommand::GetDevice {
-                            friendly_name: name,
-                        }
-                    };
-                    let _ = cmd_tx.send(cmd).await;
-                } else if topic.contains("permit_join") {
-                    let duration = parse_permit_join_payload(payload);
-                    let _ = cmd_tx.send(MqttCommand::PermitJoin { duration }).await;
+                if let Some(cmd) =
+                    command_from_publish(&pub_msg.topic, &pub_msg.payload, &base_topic)
+                {
+                    let _ = cmd_tx.send(cmd);
                 }
             }
             Ok(Event::Incoming(Packet::Disconnect)) => {
+                link.set_disconnected();
                 warn!(
                     "MQTT disconnected, retrying in {}s",
                     reconnect_delay.as_secs()
@@ -248,6 +302,7 @@ async fn run_event_loop(
             }
             Ok(_) => {}
             Err(e) => {
+                link.set_disconnected();
                 error!(
                     "MQTT event loop error: {e}; retrying in {}s",
                     reconnect_delay.as_secs()
@@ -257,6 +312,62 @@ async fn run_event_loop(
             }
         }
     }
+}
+
+/// Subscribe to the command topics, then tell the bridge the session is up:
+/// via `connected_tx` on the first connect, `MqttCommand::Connected` after a
+/// reconnect. Runs in its own task so `subscribe()` can wait for room in the
+/// request channel while the event loop keeps draining it.
+async fn subscribe_and_notify(
+    client: AsyncClient,
+    base_topic: String,
+    cmd_tx: mpsc::UnboundedSender<MqttCommand>,
+    connected_tx: Option<oneshot::Sender<()>>,
+) {
+    if !subscribe_topics(&client, &base_topic).await {
+        return;
+    }
+    info!("MQTT subscribed");
+    match connected_tx {
+        Some(tx) => {
+            let _ = tx.send(());
+        }
+        None => {
+            let _ = cmd_tx.send(MqttCommand::Connected);
+        }
+    }
+}
+
+/// Map an inbound publish on one of our subscribed topics to a bridge command.
+fn command_from_publish(topic: &str, payload: &[u8], base_topic: &str) -> Option<MqttCommand> {
+    if topic == format!("{base_topic}/bridge/request/permit_join") {
+        let duration = parse_permit_join_payload(payload);
+        return Some(MqttCommand::PermitJoin { duration });
+    }
+
+    let is_set = topic.ends_with("/set");
+    if !is_set && !topic.ends_with("/get") {
+        return None;
+    }
+    let suffix = if is_set { "/set" } else { "/get" };
+    let friendly_name = friendly_name_from_topic(topic, base_topic, suffix);
+
+    if !is_set {
+        return Some(MqttCommand::GetDevice { friendly_name });
+    }
+    // z2m accepts a bare state as well as a JSON object: `ON`, or `"ON"`.
+    let payload = match serde_json::from_slice::<serde_json::Value>(payload) {
+        Ok(serde_json::Value::String(s)) => json!({ "state": s.trim() }),
+        Ok(v) => v,
+        Err(_) => match std::str::from_utf8(payload) {
+            Ok(s) => json!({ "state": s.trim() }),
+            Err(_) => serde_json::Value::Null,
+        },
+    };
+    Some(MqttCommand::SetDevice {
+        friendly_name,
+        payload,
+    })
 }
 
 /// Double the reconnect delay, capped at MQTT_RECONNECT_DELAY_MAX.
@@ -385,6 +496,99 @@ mod tests {
         assert_eq!(
             friendly_name_from_topic("zigbee2mqtt/kitchen_light/get", "zigbee2mqtt", "/get"),
             "kitchen_light"
+        );
+    }
+
+    #[test]
+    fn link_state_logs_first_drop_only_and_resets_on_connect() {
+        let link = LinkState::default();
+        assert!(!link.is_connected());
+        assert!(link.note_dropped());
+        assert!(!link.note_dropped());
+        assert_eq!(link.set_connected(), 2);
+        assert!(link.is_connected());
+        link.set_disconnected();
+        assert!(link.note_dropped());
+    }
+
+    #[tokio::test]
+    async fn publish_while_disconnected_never_blocks() {
+        // The event loop is never polled, as during a broker outage, so
+        // nothing drains rumqttc's request channel.
+        let opts = MqttOptions::new("test", "localhost", 1883);
+        let (client, _event_loop) = AsyncClient::new(opts, MQTT_REQUEST_CAPACITY);
+        let bridge = MqttBridge {
+            client,
+            base_topic: "zigbee2mqtt".into(),
+            link: Arc::new(LinkState::default()),
+        };
+        let state = json!({"state": "ON"});
+        let publish_all = async {
+            for _ in 0..MQTT_REQUEST_CAPACITY * 3 {
+                bridge.publish_device_state("lamp", &state).await.unwrap();
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(1), publish_all)
+            .await
+            .expect("publish blocked while disconnected");
+        assert_eq!(
+            bridge.link.set_connected(),
+            (MQTT_REQUEST_CAPACITY * 2) as u64
+        );
+    }
+
+    #[test]
+    fn command_from_set_json() {
+        match command_from_publish("zigbee2mqtt/lamp/set", br#"{"state":"ON"}"#, "zigbee2mqtt") {
+            Some(MqttCommand::SetDevice {
+                friendly_name,
+                payload,
+            }) => {
+                assert_eq!(friendly_name, "lamp");
+                assert_eq!(payload, json!({"state": "ON"}));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn command_from_set_bare_and_quoted_state() {
+        for raw in [&b"ON"[..], &br#""ON""#[..]] {
+            match command_from_publish("zigbee2mqtt/lamp/set", raw, "zigbee2mqtt") {
+                Some(MqttCommand::SetDevice { payload, .. }) => {
+                    assert_eq!(payload, json!({"state": "ON"}));
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn command_from_get() {
+        assert!(matches!(
+            command_from_publish("zigbee2mqtt/lamp/get", b"", "zigbee2mqtt"),
+            Some(MqttCommand::GetDevice { friendly_name }) if friendly_name == "lamp"
+        ));
+    }
+
+    #[test]
+    fn command_from_permit_join() {
+        assert!(matches!(
+            command_from_publish(
+                "zigbee2mqtt/bridge/request/permit_join",
+                br#"{"value": true, "time": 60}"#,
+                "zigbee2mqtt"
+            ),
+            Some(MqttCommand::PermitJoin { duration: 60 })
+        ));
+    }
+
+    #[test]
+    fn command_from_unrelated_topic_is_none() {
+        assert!(command_from_publish("zigbee2mqtt/lamp", b"{}", "zigbee2mqtt").is_none());
+        // Only the exact bridge request topic, not anything mentioning it.
+        assert!(
+            command_from_publish("zigbee2mqtt/permit_join_lamp", b"1", "zigbee2mqtt").is_none()
         );
     }
 
