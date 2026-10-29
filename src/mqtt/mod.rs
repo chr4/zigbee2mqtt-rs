@@ -16,6 +16,7 @@ use crate::error::{Error, Result};
 
 const MQTT_RECONNECT_DELAY_MIN: Duration = Duration::from_secs(1);
 const MQTT_RECONNECT_DELAY_MAX: Duration = Duration::from_secs(30);
+const MAX_PACKET_SIZE: usize = 1024 * 1024;
 // Capacity of rumqttc's request channel (AsyncClient → EventLoop). Only the
 // event loop drains it, and only while connected -- see `MqttBridge::publish`.
 const MQTT_REQUEST_CAPACITY: usize = 64;
@@ -87,6 +88,11 @@ impl MqttBridge {
         let mut opts = MqttOptions::new(&cfg.client_id, &cfg.server, cfg.port);
         opts.set_keep_alive(Duration::from_secs(cfg.keepalive as u64));
         opts.set_clean_session(true);
+        // rumqttc defaults both limits to 10 KiB and treats an oversize packet
+        // as a *connection* error: a large retained `bridge/devices` (~20+
+        // devices) would make every publish -- and, via the `{base}/#`
+        // subscription, every replay on subscribe -- reconnect forever.
+        opts.set_max_packet_size(MAX_PACKET_SIZE, MAX_PACKET_SIZE);
 
         if let (Some(user), Some(pass)) = (&cfg.username, &cfg.password) {
             opts.set_credentials(user, pass);
