@@ -70,11 +70,15 @@ impl ClusterHandler for ColorCluster {
         // Build nested color object (z2m compatible)
         if hue.is_some() || saturation.is_some() || x.is_some() || y.is_some() {
             let mut color = serde_json::Map::new();
+            // Both z2m's names and the h/s keys Home Assistant's JSON light
+            // reads in "hs" color mode.
             if let Some(h) = hue {
                 color.insert("hue".into(), json!(h));
+                color.insert("h".into(), json!(h));
             }
             if let Some(s) = saturation {
                 color.insert("saturation".into(), json!(s));
+                color.insert("s".into(), json!(s));
             }
             if let Some(xv) = x {
                 color.insert("x".into(), json!(xv));
@@ -120,8 +124,10 @@ pub fn move_to_hue_sat_payload(sequence: u8, hue: u8, saturation: u8, transition
 /// Build ZCL Move to Color (XY) payload.
 /// x, y: CIE 1931 coordinates (0.0-1.0), transition: time in 1/10s units
 pub fn move_to_color_xy_payload(sequence: u8, x: f64, y: f64, transition: u16) -> Vec<u8> {
-    let xi = (x * 65536.0).round() as u16;
-    let yi = (y * 65536.0).round() as u16;
+    // ZCL: CurrentX = x * 65536, valid range 0..=0xFEFF.
+    let scale = |v: f64| (v.clamp(0.0, 1.0) * 65536.0).round().min(f64::from(0xFEFFu16)) as u16;
+    let xi = scale(x);
+    let yi = scale(y);
     vec![
         0x11,
         sequence,

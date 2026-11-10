@@ -8,6 +8,7 @@ use crate::coordinator::znp::frame::{Subsystem, ZnpFrame};
 
 mod sys {
     pub const RESET_REQ: u8 = 0x00;
+    pub const PING: u8 = 0x01;
     pub const VERSION: u8 = 0x02;
     pub const OSAL_NV_WRITE: u8 = 0x09;
 }
@@ -19,6 +20,11 @@ pub enum ResetType {
 
 pub fn sys_reset_req(reset_type: ResetType) -> ZnpFrame {
     ZnpFrame::areq(Subsystem::Sys, sys::RESET_REQ, vec![reset_type as u8])
+}
+
+/// SYS_PING: answered by the coordinator itself; used as a liveness check.
+pub fn sys_ping() -> ZnpFrame {
+    ZnpFrame::sreq(Subsystem::Sys, sys::PING, vec![])
 }
 
 pub fn sys_version() -> ZnpFrame {
@@ -164,18 +170,27 @@ pub fn af_data_request(
     data.push(src_ep);
     data.extend_from_slice(&cluster_id.to_le_bytes());
     data.push(trans_id);
-    data.push(0x30); // options: AF_ACK_REQUEST (0x10) | AF_DISCV_ROUTE (0x20)
+    // Options: APS ack requested, so AF_DATA_CONFIRM reports end-to-end
+    // delivery. NOT 0x20: that bit is SUPPRESS_ROUTE_DISC_NETWORK (zigpy-znp
+    // `TransmitOptions`), which stops the stack from finding a new route to
+    // a device whose old one broke -- it then stays unreachable.
+    data.push(0x10);
     data.push(0xFF); // radius: max
     data.push(payload.len() as u8);
     data.extend(payload);
     ZnpFrame::sreq(Subsystem::Af, af::DATA_REQUEST, data)
 }
 
+/// AF_INCOMING_MSG: GroupID(u16) ClusterID(u16) SrcAddr(u16) SrcEndpoint(u8)
+/// DstEndpoint(u8) WasBroadcast(u8) LinkQuality(u8) SecurityUse(u8)
+/// TimeStamp(u32) TransSeqNumber(u8) Len(u8) Data.
 #[derive(Debug, Clone)]
 pub struct AfIncomingMsg {
     pub cluster_id: u16,
     pub src_addr: u16,
     pub src_ep: u8,
+    pub dst_ep: u8,
+    pub was_broadcast: bool,
     pub link_quality: u8,
     pub data: Vec<u8>,
 }
@@ -188,6 +203,8 @@ impl AfIncomingMsg {
         let cluster_id = u16::from_le_bytes([raw[2], raw[3]]);
         let src_addr = u16::from_le_bytes([raw[4], raw[5]]);
         let src_ep = raw[6];
+        let dst_ep = raw[7];
+        let was_broadcast = raw[8] != 0;
         let link_quality = raw[9];
         let len = raw[16] as usize;
         if raw.len() < 17 + len {
@@ -198,21 +215,62 @@ impl AfIncomingMsg {
             cluster_id,
             src_addr,
             src_ep,
+            dst_ep,
+            was_broadcast,
             link_quality,
             data,
         })
     }
 }
 
+/// Z-Stack `ZStatus` values that can come back in an AF_DATA_CONFIRM (or a
+/// failed AF_DATA_REQUEST SRSP), per Z-Stack's ZComDef.h / zigpy-znp's
+/// `Status` enum (recalled, not checked against the header here).
+pub mod status {
+    pub const SUCCESS: u8 = 0x00;
+    pub const MEM_ERROR: u8 = 0x10;
+    pub const BUFFER_FULL: u8 = 0x11;
+    pub const APS_NO_ACK: u8 = 0xB7;
+    pub const NWK_NO_ROUTE: u8 = 0xCD;
+    pub const MAC_CHANNEL_ACCESS_FAILURE: u8 = 0xE1;
+    pub const MAC_NO_ACK: u8 = 0xE9;
+    pub const MAC_TRANSACTION_EXPIRED: u8 = 0xF0;
+    pub const MAC_TRANSACTION_OVERFLOW: u8 = 0xF1;
+}
+
+/// Human-readable name for a Z-Stack delivery status.
+pub fn status_name(code: u8) -> &'static str {
+    match code {
+        status::SUCCESS => "success",
+        0x01 => "failure",
+        0x02 => "invalid parameter",
+        status::MEM_ERROR => "out of memory",
+        status::BUFFER_FULL => "buffer full",
+        0xB1 => "APS failure",
+        status::APS_NO_ACK => "no APS ack",
+        0xC2 => "invalid NWK request",
+        0xC8 => "unknown NWK device",
+        0xCC => "no NWK ack",
+        status::NWK_NO_ROUTE => "no route",
+        status::MAC_CHANNEL_ACCESS_FAILURE => "MAC channel access failure",
+        status::MAC_NO_ACK => "no MAC ack",
+        status::MAC_TRANSACTION_EXPIRED => "MAC transaction expired (device asleep)",
+        status::MAC_TRANSACTION_OVERFLOW => "MAC transaction queue full",
+        _ => "unknown status",
+    }
+}
+
 // ─── ZDO subsystem ────────────────────────────────────────────────────────────
 
 mod zdo {
+    pub const NWK_ADDR_REQ: u8 = 0x00;
     pub const IEEE_ADDR_REQ: u8 = 0x01;
     pub const SIMPLE_DESC_REQ: u8 = 0x04;
     pub const ACTIVE_EP_REQ: u8 = 0x05;
     pub const BIND_REQ: u8 = 0x21;
     pub const PERMIT_JOIN_REQ: u8 = 0x36;
     pub const STARTUP_FROM_APP: u8 = 0x40;
+    pub const EXT_ROUTE_DISC: u8 = 0x45;
 }
 
 pub fn zdo_startup_from_app(start_delay_ms: u16) -> ZnpFrame {
@@ -258,6 +316,29 @@ pub fn zdo_ieee_addr_req(nwk_addr: u16) -> ZnpFrame {
     ZnpFrame::sreq(Subsystem::Zdo, zdo::IEEE_ADDR_REQ, data)
 }
 
+/// Look up the current NWK address of `ieee` (ZDO_NWK_ADDR_REQ, single device
+/// response). The answer arrives as a ZDO_NWK_ADDR_RSP AREQ, laid out like
+/// ZDO_IEEE_ADDR_RSP. Used to recover when a device changed its NWK address
+/// without us seeing its announcement.
+pub fn zdo_nwk_addr_req(ieee: [u8; 8]) -> ZnpFrame {
+    let mut data = Vec::with_capacity(10);
+    data.extend_from_slice(&ieee);
+    data.push(0x00); // ReqType: single device response
+    data.push(0x00); // StartIndex
+    ZnpFrame::sreq(Subsystem::Zdo, zdo::NWK_ADDR_REQ, data)
+}
+
+/// Ask the stack to (re)discover a route to `dst_addr` (ZDO_EXT_ROUTE_DISC:
+/// DstAddr, Options, Radius), as zigbee-herdsman does before retrying a
+/// failed delivery.
+pub fn zdo_ext_route_disc(dst_addr: u16, radius: u8) -> ZnpFrame {
+    let mut data = Vec::with_capacity(4);
+    data.extend_from_slice(&dst_addr.to_le_bytes());
+    data.push(0x00); // options
+    data.push(radius);
+    ZnpFrame::sreq(Subsystem::Zdo, zdo::EXT_ROUTE_DISC, data)
+}
+
 /// Bind `cluster_id` on `src_ieee`'s `src_ep` to `dst_ieee`'s `dst_ep`
 /// (normally the coordinator's own IEEE address + endpoint). Devices whose
 /// relevant clusters are *output* clusters (e.g. remote controls, whose
@@ -288,7 +369,9 @@ pub fn zdo_bind_req(
     ZnpFrame::sreq(Subsystem::Zdo, zdo::BIND_REQ, data)
 }
 
-/// ZDO_IEEE_ADDR_RSP (AREQ cmd1=0x81)
+/// ZDO_IEEE_ADDR_RSP (AREQ cmd1=0x81), and ZDO_NWK_ADDR_RSP (0x80) which has
+/// the same layout: Status(u8) IEEE(8) NWK(u16) StartIndex(u8)
+/// NumAssocDev(u8) AssocDevList.
 #[derive(Debug, Clone)]
 pub struct IeeeAddrRsp {
     pub ieee_addr: [u8; 8],
@@ -369,7 +452,9 @@ pub struct ActiveEpRsp {
 
 impl ActiveEpRsp {
     pub fn parse(data: &[u8]) -> Option<Self> {
-        if data.len() < 6 {
+        // SrcAddr(u16) Status(u8) NWKAddrOfInterest(u16) Count(u8) list.
+        // An error reply (device not found/timeout) carries no usable list.
+        if data.len() < 6 || data[2] != 0 {
             return None;
         }
         let nwk_addr = u16::from_le_bytes([data[3], data[4]]);
@@ -521,7 +606,7 @@ mod tests {
         assert_eq!(frame.data[3], 1); // src_ep
         assert_eq!(u16::from_le_bytes([frame.data[4], frame.data[5]]), 0x0006);
         assert_eq!(frame.data[6], 5); // trans_id
-        assert_eq!(frame.data[7], 0x30); // options
+        assert_eq!(frame.data[7], 0x10); // options: APS ack, route discovery allowed
         assert_eq!(frame.data[8], 0xFF); // radius
         assert_eq!(frame.data[9], 3); // payload length
         assert_eq!(frame.data[10..13], [0x11, 0x05, 0x01]);
@@ -535,14 +620,53 @@ mod tests {
         raw[4] = 0x34;
         raw[5] = 0x12; // 0x1234
         raw[6] = 1; // src_ep
+        raw[7] = 1; // dst_ep
+        raw[8] = 1; // was_broadcast
         raw[9] = 120; // link_quality
         raw[16] = 3; // data len
         raw.extend_from_slice(&[0x11, 0x01, 0x01]);
         let msg = AfIncomingMsg::parse(&raw).unwrap();
         assert_eq!(msg.cluster_id, 0x0006);
         assert_eq!(msg.src_addr, 0x1234);
+        assert_eq!(msg.dst_ep, 1);
+        assert!(msg.was_broadcast);
         assert_eq!(msg.link_quality, 120);
         assert_eq!(msg.data, vec![0x11, 0x01, 0x01]);
+    }
+
+    #[test]
+    fn parse_af_incoming_msg_truncated_data_is_rejected() {
+        let mut raw = vec![0; 17];
+        raw[16] = 3; // claims 3 bytes, has 1
+        raw.push(0x18);
+        assert!(AfIncomingMsg::parse(&raw).is_none());
+    }
+
+    #[test]
+    fn zdo_nwk_addr_req_format() {
+        let frame = zdo_nwk_addr_req([1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(frame.frame_type, FrameType::SReq);
+        assert_eq!((frame.subsystem, frame.cmd1), (Subsystem::Zdo, 0x00));
+        assert_eq!(frame.data, vec![1, 2, 3, 4, 5, 6, 7, 8, 0, 0]);
+    }
+
+    #[test]
+    fn zdo_ext_route_disc_format() {
+        let frame = zdo_ext_route_disc(0x1234, 30);
+        assert_eq!((frame.subsystem, frame.cmd1), (Subsystem::Zdo, 0x45));
+        assert_eq!(frame.data, vec![0x34, 0x12, 0x00, 30]);
+    }
+
+    #[test]
+    fn nwk_addr_rsp_parses_like_ieee_addr_rsp() {
+        let mut data = vec![0x00];
+        data.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        data.extend_from_slice(&[0x78, 0x56, 0x00, 0x00]);
+        let rsp = IeeeAddrRsp::parse(&data).unwrap();
+        assert_eq!(rsp.nwk_addr, 0x5678);
+        assert_eq!(rsp.ieee_addr, [1, 2, 3, 4, 5, 6, 7, 8]);
+        data[0] = 0x81; // device not found
+        assert!(IeeeAddrRsp::parse(&data).is_none());
     }
 
     #[test]

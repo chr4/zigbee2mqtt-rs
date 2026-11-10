@@ -44,6 +44,16 @@ pub fn parse_message(
     let payload = &raw[payload_offset..];
 
     let mut arrow_hold_direction: Option<Option<String>> = None;
+    // Manufacturer-specific attributes/commands reuse ids from the standard
+    // space; decoding them as standard ones would publish garbage state.
+    // Only Scenes has vendor decoders (IKEA arrows).
+    if header.mfr_code.is_some() && cluster_id != 0x0005 {
+        tracing::debug!(
+            "Skipping manufacturer-specific frame (mfr 0x{:04X}) on cluster 0x{cluster_id:04X}",
+            header.mfr_code.unwrap_or_default()
+        );
+        return Ok(None);
+    }
     let pairs = if cluster_id == 0x0500 {
         match header.frame_type {
             FrameType::Global if header.command_id == global::REPORT_ATTRIBUTES => {
@@ -170,9 +180,9 @@ fn parse_read_attr_rsp(buf: &[u8]) -> Vec<AttributeReport> {
         if pos >= buf.len() {
             break;
         }
-        let data_type = attribute::DataType::from_u8(buf[pos]);
+        let type_id = buf[pos];
         pos += 1;
-        match attribute::AttributeValue::parse(data_type, &buf[pos..]) {
+        match attribute::parse_value(type_id, &buf[pos..]) {
             Ok((value, consumed)) => {
                 reports.push(AttributeReport { attr_id, value });
                 pos += consumed;
@@ -310,7 +320,7 @@ mod tests {
             0x01, 0x00, 0x05, // group=1, scene=5
         ];
         let msg = parse_message(0x0005, &raw, None, None).unwrap().unwrap();
-        assert_eq!(msg.values["action"], "recall");
+        assert_eq!(msg.values["action"], "recall_5");
         assert_eq!(msg.values["action_scene"], 5);
     }
 

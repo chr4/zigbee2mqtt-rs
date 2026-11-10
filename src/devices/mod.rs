@@ -35,6 +35,11 @@ pub struct Device {
     #[serde(default)]
     pub state: serde_json::Map<String, serde_json::Value>,
     pub interview_complete: bool,
+    /// Bindings and attribute reporting have been set up on the device --
+    /// by this bridge, or by zigbee2mqtt before it (database.db
+    /// `meta.configured`).
+    #[serde(default)]
+    pub configured: bool,
     #[serde(default)]
     pub disabled: bool,
 }
@@ -55,14 +60,33 @@ impl Device {
             arrow_hold_direction: None,
             state: serde_json::Map::new(),
             interview_complete: false,
+            configured: false,
             disabled: false,
         }
     }
 
+    /// Merge new state values in. Nested objects (e.g. `color`) are merged
+    /// key by key, like zigbee2mqtt's deep state merge: a report carrying
+    /// only `currentY` must not wipe the known `color.x`.
     pub fn merge_state(&mut self, values: serde_json::Map<String, serde_json::Value>) {
-        for (k, v) in values {
-            self.state.insert(k, v);
-        }
+        merge_json(&mut self.state, values);
+    }
+
+    /// Whether the device runs on mains power (and so is always reachable,
+    /// unlike a sleepy battery device). Unknown counts as mains, matching
+    /// `device_type()`.
+    #[must_use]
+    pub fn is_mains_powered(&self) -> bool {
+        self.device_type() == "Router"
+    }
+
+    /// First endpoint implementing `cluster_id` as a server (input cluster).
+    #[must_use]
+    pub fn endpoint_with_input_cluster(&self, cluster_id: u16) -> Option<u8> {
+        self.endpoints
+            .iter()
+            .find(|e| e.input_clusters.contains(&cluster_id))
+            .map(|e| e.endpoint)
     }
 
     pub fn display_name(&self) -> &str {
@@ -138,7 +162,29 @@ impl Device {
     }
 }
 
+fn merge_json(
+    target: &mut serde_json::Map<String, serde_json::Value>,
+    values: serde_json::Map<String, serde_json::Value>,
+) {
+    for (k, v) in values {
+        match (target.get_mut(&k), v) {
+            (Some(serde_json::Value::Object(existing)), serde_json::Value::Object(new)) => {
+                merge_json(existing, new);
+            }
+            (_, v) => {
+                target.insert(k, v);
+            }
+        }
+    }
+}
+
 // ── Registry ──────────────────────────────────────────────────────────────────
+//
+// Three maps, kept consistent by the methods below. None of them ever holds a
+// guard on one map while locking another, so no lock-order deadlock is
+// possible between callers on different tasks/threads (e.g. the persistence
+// saver on the blocking pool). Callers must likewise never hold a returned
+// `Ref`/`RefMut` across an `.await` or while calling back into the registry.
 
 pub struct DeviceRegistry {
     by_ieee: DashMap<IeeeAddr, Device>,
@@ -171,10 +217,31 @@ impl DeviceRegistry {
         if let Some(old) = self.by_ieee.insert(ieee, device) {
             self.unindex(&old);
         }
-        if nwk != 0 {
-            self.by_nwk.insert(nwk, ieee);
-        }
+        self.index_nwk(nwk, ieee);
         self.by_name.insert(name, ieee);
+    }
+
+    /// Point `nwk` at `ieee`. NWK addresses are unique within the network,
+    /// so if another device still claims `nwk`, its address is stale (it
+    /// rejoined elsewhere without us noticing): forget it rather than keep
+    /// sending that device's commands to whoever has the address now. It is
+    /// re-learned from its next frame or announcement.
+    fn index_nwk(&self, nwk: NwkAddr, ieee: IeeeAddr) {
+        if nwk == 0 {
+            return;
+        }
+        let displaced = self.by_nwk.insert(nwk, ieee);
+        if let Some(other) = displaced.filter(|other| *other != ieee) {
+            if let Some(mut dev) = self.by_ieee.get_mut(&other) {
+                if dev.nwk_addr == nwk {
+                    tracing::info!(
+                        "NWK 0x{nwk:04X} now belongs to {ieee}; {} must have moved, forgetting its stale address",
+                        dev.friendly_name
+                    );
+                    dev.nwk_addr = 0;
+                }
+            }
+        }
     }
 
     /// Drop `dev`'s index entries, but only those still pointing at it -- a
@@ -195,8 +262,14 @@ impl DeviceRegistry {
         &self,
         addr: NwkAddr,
     ) -> Option<dashmap::mapref::one::Ref<'_, IeeeAddr, Device>> {
-        let ieee = self.by_nwk.get(&addr)?;
-        self.by_ieee.get(ieee.value())
+        let ieee = self.ieee_for_nwk(addr)?;
+        self.by_ieee.get(&ieee)
+    }
+
+    /// IEEE address currently known for `addr`.
+    #[must_use]
+    pub fn ieee_for_nwk(&self, addr: NwkAddr) -> Option<IeeeAddr> {
+        self.by_nwk.get(&addr).map(|r| *r.value())
     }
 
     pub fn get_mut_by_ieee(
@@ -210,14 +283,20 @@ impl DeviceRegistry {
         &self,
         addr: NwkAddr,
     ) -> Option<dashmap::mapref::one::RefMut<'_, IeeeAddr, Device>> {
-        let ieee = *self.by_nwk.get(&addr)?.value();
+        let ieee = self.ieee_for_nwk(addr)?;
         self.by_ieee.get_mut(&ieee)
     }
 
     #[must_use]
     pub fn find_by_name(&self, name: &str) -> Option<Device> {
-        let ieee = self.by_name.get(name)?;
-        self.by_ieee.get(ieee.value()).map(|r| r.value().clone())
+        let ieee = *self.by_name.get(name)?.value();
+        self.by_ieee.get(&ieee).map(|r| r.value().clone())
+    }
+
+    /// Snapshot of one device.
+    #[must_use]
+    pub fn snapshot(&self, ieee: &IeeeAddr) -> Option<Device> {
+        self.by_ieee.get(ieee).map(|r| r.value().clone())
     }
 
     pub fn remove_by_ieee(&self, addr: &IeeeAddr) {
@@ -226,25 +305,32 @@ impl DeviceRegistry {
         }
     }
 
-    pub fn update_nwk_addr(&self, ieee: &IeeeAddr, new_nwk: NwkAddr) {
-        if let Some(mut dev) = self.by_ieee.get_mut(ieee) {
-            self.by_nwk.remove_if(&dev.nwk_addr, |_, v| v == ieee);
-            dev.nwk_addr = new_nwk;
-            if new_nwk != 0 {
-                self.by_nwk.insert(new_nwk, *ieee);
-            }
+    /// Record `ieee`'s new NWK address. Returns the previous one, or `None`
+    /// if the device is unknown.
+    pub fn update_nwk_addr(&self, ieee: &IeeeAddr, new_nwk: NwkAddr) -> Option<NwkAddr> {
+        let old_nwk = {
+            let mut dev = self.by_ieee.get_mut(ieee)?;
+            std::mem::replace(&mut dev.nwk_addr, new_nwk)
+        };
+        if old_nwk != new_nwk {
+            self.by_nwk.remove_if(&old_nwk, |_, v| v == ieee);
         }
+        self.index_nwk(new_nwk, *ieee);
+        Some(old_nwk)
     }
 
     /// Rename a device, keeping the `by_name` index in sync. Renaming a device
     /// by mutating `Device::friendly_name` directly would leave a stale/missing
     /// `by_name` entry, breaking MQTT set/get lookups for the new name.
     pub fn rename(&self, ieee: &IeeeAddr, new_name: String) {
-        if let Some(mut dev) = self.by_ieee.get_mut(ieee) {
-            self.by_name.remove_if(&dev.friendly_name, |_, v| v == ieee);
-            dev.friendly_name = new_name.clone();
-            self.by_name.insert(new_name, *ieee);
-        }
+        let old_name = {
+            let Some(mut dev) = self.by_ieee.get_mut(ieee) else {
+                return;
+            };
+            std::mem::replace(&mut dev.friendly_name, new_name.clone())
+        };
+        self.by_name.remove_if(&old_name, |_, v| v == ieee);
+        self.by_name.insert(new_name, *ieee);
     }
 
     #[must_use]
@@ -354,6 +440,46 @@ mod tests {
         assert!(reg.get_by_nwk(0x1234).is_none());
         assert!(reg.find_by_name("old").is_none());
         assert!(reg.find_by_name("new").is_some());
+    }
+
+    #[test]
+    fn nwk_reassignment_forgets_stale_owner() {
+        let reg = DeviceRegistry::new();
+        let other = IeeeAddr([9; 8]);
+        reg.add(Device::new(test_ieee(), 0x1234));
+        reg.add(Device::new(other, 0x5678));
+        // `other` shows up at 0x1234: test_ieee() must have moved away.
+        reg.update_nwk_addr(&other, 0x1234);
+        assert_eq!(reg.get_by_nwk(0x1234).unwrap().ieee_addr, other);
+        assert_eq!(reg.get_by_ieee(&test_ieee()).unwrap().nwk_addr, 0);
+        assert!(reg.get_by_nwk(0x5678).is_none());
+    }
+
+    #[test]
+    fn update_nwk_addr_returns_previous() {
+        let reg = DeviceRegistry::new();
+        reg.add(Device::new(test_ieee(), 0x1234));
+        assert_eq!(reg.update_nwk_addr(&test_ieee(), 0x1234), Some(0x1234));
+        assert!(reg.get_by_nwk(0x1234).is_some());
+        assert_eq!(reg.update_nwk_addr(&IeeeAddr([7; 8]), 0x1), None);
+    }
+
+    #[test]
+    fn merge_state_merges_nested_objects() {
+        let mut dev = Device::new(test_ieee(), 0x1234);
+        let mut a = serde_json::Map::new();
+        a.insert("color".into(), json!({"x": 0.3, "y": 0.4}));
+        dev.merge_state(a);
+        let mut b = serde_json::Map::new();
+        b.insert("color".into(), json!({"y": 0.5}));
+        b.insert("state".into(), json!("ON"));
+        dev.merge_state(b);
+        assert_eq!(dev.state["color"], json!({"x": 0.3, "y": 0.5}));
+        // Scalars replace objects and vice versa.
+        let mut c = serde_json::Map::new();
+        c.insert("color".into(), json!(null));
+        dev.merge_state(c);
+        assert_eq!(dev.state["color"], json!(null));
     }
 
     #[test]

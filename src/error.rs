@@ -32,6 +32,12 @@ pub enum Error {
         reason: &'static str,
     },
 
+    /// The coordinator could not deliver a frame to a device: either the
+    /// AF_DATA_REQUEST SRSP or the later AF_DATA_CONFIRM carried a non-zero
+    /// Z-Stack status (no route, no ack, buffer full, ...).
+    #[error("delivery to 0x{nwk:04X} failed: {} (0x{status:02X})", crate::coordinator::znp::commands::status_name(*status))]
+    DeliveryFailed { nwk: u16, status: u8 },
+
     #[error("ZCL protocol error: {0}")]
     Zcl(String),
 

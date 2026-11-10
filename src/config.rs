@@ -126,6 +126,39 @@ impl Default for SerialConfig {
     }
 }
 
+impl MqttConfig {
+    /// Accept zigbee2mqtt's URL form, `server: mqtt://host[:port]`, next to
+    /// a plain host name -- a z2m configuration.yaml otherwise fails to
+    /// connect with a confusing DNS error.
+    fn normalize_server(&mut self) -> Result<()> {
+        let server = self.server.trim();
+        if server.starts_with("mqtts://") || server.starts_with("wss://") {
+            return Err(Error::Config(
+                "TLS MQTT connections are not supported; use mqtt://".into(),
+            ));
+        }
+        let Some(rest) = server.strip_prefix("mqtt://").or_else(|| server.strip_prefix("tcp://"))
+        else {
+            return Ok(());
+        };
+        let host_port = rest.trim_end_matches('/');
+        let (host, port) = match host_port.rsplit_once(':') {
+            Some((host, port)) if !host.contains(':') || host.ends_with(']') => {
+                let port = port
+                    .parse::<u16>()
+                    .map_err(|_| Error::Config(format!("invalid port in mqtt.server {server:?}")))?;
+                (host, Some(port))
+            }
+            _ => (host_port, None),
+        };
+        self.server = host.trim_start_matches('[').trim_end_matches(']').to_string();
+        if let Some(port) = port {
+            self.port = port;
+        }
+        Ok(())
+    }
+}
+
 impl Default for MqttConfig {
     fn default() -> Self {
         Self {
@@ -159,7 +192,8 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)
             .map_err(|e| Error::Config(format!("cannot read {}: {e}", path.display())))?;
-        let config: Config = serde_yml::from_str(&content)?;
+        let mut config: Config = serde_yml::from_str(&content)?;
+        config.mqtt.normalize_server()?;
         config.validate()?;
         Ok(config)
     }
@@ -239,6 +273,36 @@ mod tests {
         let mut cfg = Config::default();
         cfg.mqtt.base_topic = String::new();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn mqtt_server_url_form_is_accepted() {
+        let mut m = MqttConfig {
+            server: "mqtt://10.5.9.1:1884".into(),
+            ..MqttConfig::default()
+        };
+        m.normalize_server().unwrap();
+        assert_eq!((m.server.as_str(), m.port), ("10.5.9.1", 1884));
+
+        let mut m = MqttConfig {
+            server: "mqtt://broker.local".into(),
+            ..MqttConfig::default()
+        };
+        m.normalize_server().unwrap();
+        assert_eq!((m.server.as_str(), m.port), ("broker.local", 1883));
+
+        let mut m = MqttConfig {
+            server: "10.0.0.2".into(),
+            ..MqttConfig::default()
+        };
+        m.normalize_server().unwrap();
+        assert_eq!(m.server, "10.0.0.2");
+
+        let mut m = MqttConfig {
+            server: "mqtts://x".into(),
+            ..MqttConfig::default()
+        };
+        assert!(m.normalize_server().is_err());
     }
 
     #[test]

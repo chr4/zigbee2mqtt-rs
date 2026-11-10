@@ -8,6 +8,11 @@ use tokio_util::codec::{Decoder, Encoder};
 
 pub const SOF: u8 = 0xFE;
 
+/// Largest data length Z-Stack's MT layer sends (MT_RPC_DATA_MAX). A bigger
+/// length byte means this 0xFE wasn't really a start of frame; waiting for
+/// that many bytes would hold back every real frame behind it.
+const MAX_DATA_LEN: usize = 250;
+
 // ── Frame types (bits [7:5] of CMD0) ─────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,6 +173,10 @@ impl Decoder for ZnpCodec {
             }
 
             let len = src[1] as usize;
+            if len > MAX_DATA_LEN {
+                src.advance(1);
+                continue;
+            }
             let total = 5 + len;
 
             if src.len() < total {
@@ -280,6 +289,16 @@ mod tests {
 
         let decoded = ZnpCodec.decode(&mut buf).unwrap().unwrap();
         assert_eq!(decoded, good);
+    }
+
+    #[test]
+    fn implausible_length_is_skipped_without_waiting() {
+        let good = ZnpFrame::sreq(Subsystem::Sys, 0x02, vec![0xAB]);
+        let mut buf = BytesMut::new();
+        buf.put_u8(SOF);
+        buf.put_u8(0xFF); // no MT frame is this long
+        buf.extend_from_slice(&good.to_bytes());
+        assert_eq!(ZnpCodec.decode(&mut buf).unwrap().unwrap(), good);
     }
 
     #[test]

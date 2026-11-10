@@ -177,7 +177,10 @@ impl AttributeValue {
             _ => {
                 // Unknown type — skip based on fixed length if available
                 if let Some(len) = data_type.fixed_len() {
-                    Ok((Self::Bytes, len.min(buf.len())))
+                    if buf.len() < len {
+                        return Err(Error::Zcl("truncated attribute value".into()));
+                    }
+                    Ok((Self::Bytes, len))
                 } else {
                     Err(Error::Zcl(format!("unsupported attribute type {:?}", data_type)))
                 }
@@ -210,6 +213,47 @@ impl AttributeValue {
     }
 }
 
+/// Size of a fixed-length ZCL data type by its raw type id (ZCL spec table
+/// 2-10), including the many types `DataType` doesn't model (40-64 bit
+/// integers, time/date, cluster/attribute ids, IEEE address, security key).
+/// Lets parsers skip a value they don't understand instead of abandoning
+/// the rest of the frame.
+pub fn raw_fixed_len(type_id: u8) -> Option<usize> {
+    match type_id {
+        0x00 => Some(0),
+        // data8..data64, bitmap8..bitmap64, uint8..uint64, int8..int64
+        0x08..=0x0F | 0x18..=0x1F | 0x20..=0x27 | 0x28..=0x2F => {
+            Some(usize::from(type_id & 0x07) + 1)
+        }
+        0x10 => Some(1),        // boolean
+        0x30 => Some(1),        // enum8
+        0x31 => Some(2),        // enum16
+        0x38 => Some(2),        // semi-precision float
+        0x39 => Some(4),        // single-precision float
+        0x3A => Some(8),        // double-precision float
+        0xE0..=0xE2 => Some(4), // time of day, date, UTC time
+        0xE8 | 0xE9 => Some(2), // cluster id, attribute id
+        0xEA => Some(4),        // BACnet OID
+        0xF0 => Some(8),        // IEEE address
+        0xF1 => Some(16),       // 128-bit security key
+        _ => None,
+    }
+}
+
+/// Parse one value of raw type `type_id`: known types are decoded, other
+/// fixed-length types are skipped as `Bytes`.
+pub fn parse_value(type_id: u8, buf: &[u8]) -> Result<(AttributeValue, usize)> {
+    let data_type = DataType::from_u8(type_id);
+    if data_type == DataType::Invalid {
+        return match raw_fixed_len(type_id) {
+            Some(len) if buf.len() >= len => Ok((AttributeValue::Bytes, len)),
+            Some(_) => Err(Error::Zcl("truncated attribute value".into())),
+            None => Err(Error::Zcl(format!("unsupported attribute type 0x{type_id:02X}"))),
+        };
+    }
+    AttributeValue::parse(data_type, buf)
+}
+
 #[derive(Debug, Clone)]
 pub struct AttributeReport {
     pub attr_id: u16,
@@ -222,10 +266,10 @@ impl AttributeReport {
         let mut reports = Vec::new();
         let mut pos = 0;
         while pos + 3 <= buf.len() {
-            let attr_id   = u16::from_le_bytes([buf[pos], buf[pos + 1]]);
-            let data_type = DataType::from_u8(buf[pos + 2]);
+            let attr_id = u16::from_le_bytes([buf[pos], buf[pos + 1]]);
+            let type_id = buf[pos + 2];
             pos += 3;
-            match AttributeValue::parse(data_type, &buf[pos..]) {
+            match parse_value(type_id, &buf[pos..]) {
                 Ok((value, consumed)) => {
                     reports.push(AttributeReport { attr_id, value });
                     pos += consumed;
@@ -388,6 +432,20 @@ mod tests {
         assert_eq!(reports[0].value.as_bool(), Some(true));
         assert_eq!(reports[1].attr_id, 0x0001);
         assert_eq!(reports[1].value.as_f64(), Some(254.0));
+    }
+
+    #[test]
+    fn unknown_fixed_size_types_are_skipped_not_fatal() {
+        #[rustfmt::skip]
+        let buf = [
+            0x01, 0x00, 0xE2, 1, 2, 3, 4, // attr 1: UTC time (unmodelled), 4 bytes
+            0x02, 0x00, 0x25, 1, 2, 3, 4, 5, 6, // attr 2: uint48
+            0x03, 0x00, 0x20, 0x2A,       // attr 3: uint8 = 42
+        ];
+        let reports = AttributeReport::parse_all(&buf);
+        assert_eq!(reports.len(), 3);
+        assert_eq!(reports[2].attr_id, 3);
+        assert_eq!(reports[2].value.as_f64(), Some(42.0));
     }
 
     #[test]
