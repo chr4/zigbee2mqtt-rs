@@ -74,6 +74,11 @@ pub fn process_command_with_mfr_code(
         match command_id {
             IKEA_ARROW_SINGLE if payload.len() >= 2 => {
                 let value = u16::from_le_bytes([payload[0], payload[1]]);
+                // Sent while the centre (toggle) button is held -- not an
+                // arrow press (zigbee-herdsman-converters ignores it too).
+                if value == 2 {
+                    return (vec![], None);
+                }
                 let direction = if value == 257 { "left" } else { "right" };
                 return (
                     vec![("action".into(), json!(format!("arrow_{direction}_click")))],
@@ -119,7 +124,7 @@ pub fn process_command_with_mfr_code(
             let group_id = u16::from_le_bytes([payload[0], payload[1]]);
             let scene_id = payload[2];
             vec![
-                ("action".into(), json!("store")),
+                ("action".into(), json!(format!("store_{scene_id}"))),
                 ("action_group".into(), json!(group_id)),
                 ("action_scene".into(), json!(scene_id)),
             ]
@@ -128,7 +133,7 @@ pub fn process_command_with_mfr_code(
             let group_id = u16::from_le_bytes([payload[0], payload[1]]);
             let scene_id = payload[2];
             vec![
-                ("action".into(), json!("recall")),
+                ("action".into(), json!(format!("recall_{scene_id}"))),
                 ("action_group".into(), json!(group_id)),
                 ("action_scene".into(), json!(scene_id)),
             ]
@@ -148,7 +153,7 @@ mod tests {
         let (result, update) = process_command_with_mfr_code(RECALL_SCENE, &payload, None, None);
         assert!(result
             .iter()
-            .any(|(k, v)| k == "action" && v == &json!("recall")));
+            .any(|(k, v)| k == "action" && v == &json!("recall_5")));
         assert!(result
             .iter()
             .any(|(k, v)| k == "action_group" && v == &json!(1)));
@@ -164,7 +169,7 @@ mod tests {
         let (result, _) = process_command_with_mfr_code(STORE_SCENE, &payload, None, None);
         assert!(result
             .iter()
-            .any(|(k, v)| k == "action" && v == &json!("store")));
+            .any(|(k, v)| k == "action" && v == &json!("store_3")));
     }
 
     #[test]
@@ -194,6 +199,14 @@ mod tests {
             process_command_with_mfr_code(RECALL_SCENE, &[0x01], None, None),
             (vec![], None)
         );
+    }
+
+    #[test]
+    fn ikea_arrow_single_value_2_is_toggle_hold_noise() {
+        let (result, update) =
+            process_command_with_mfr_code(IKEA_ARROW_SINGLE, &[0x02, 0x00, 0x00, 0x00], Some(IKEA_MFR_CODE), None);
+        assert!(result.is_empty());
+        assert_eq!(update, None);
     }
 
     #[test]

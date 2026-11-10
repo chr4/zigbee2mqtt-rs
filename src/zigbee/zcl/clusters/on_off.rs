@@ -36,6 +36,10 @@ impl ClusterHandler for OnOffCluster {
             0x00 => vec![("action".into(), json!("off"))],
             0x01 => vec![("action".into(), json!("on"))],
             0x02 => vec![("action".into(), json!("toggle"))],
+            // Off With Effect / On With Recall Global Scene / On With Timed
+            // Off (e.g. the IKEA motion sensor switching its bound lights).
+            0x40 => vec![("action".into(), json!("off"))],
+            0x41 | 0x42 => vec![("action".into(), json!("on"))],
             _ => vec![],
         }
     }
@@ -50,8 +54,13 @@ pub fn set_state_payload(sequence: u8, state: &str) -> Option<Vec<u8>> {
         "TOGGLE" => 0x02u8,
         _ => return None,
     };
-    // Cluster-specific, client→server, no mfr, disable default response
-    Some(vec![0x11, sequence, cmd])
+    Some(command_payload(sequence, cmd))
+}
+
+/// On/Off cluster command `command_id` (0x00 Off, 0x01 On, 0x02 Toggle):
+/// cluster-specific, client→server, no mfr, disable default response.
+pub fn command_payload(sequence: u8, command_id: u8) -> Vec<u8> {
+    vec![0x11, sequence, command_id]
 }
 
 #[cfg(test)]

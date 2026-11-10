@@ -55,3 +55,7 @@ strip = true
 
 [profile.dev]
 opt-level = 1        # Faster compilation, still usable on RPi 3
+
+[dev-dependencies]
+# Paused/auto-advancing time for transport timeout tests.
+tokio = { version = "1", features = ["full", "test-util"] }

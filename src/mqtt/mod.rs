@@ -6,10 +6,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use rumqttc::{AsyncClient, ClientError, Event, EventLoop, MqttOptions, Packet, QoS};
+use rumqttc::{AsyncClient, ClientError, Event, EventLoop, MqttOptions, Outgoing, Packet, QoS};
 use serde_json::json;
-use tokio::sync::{mpsc, oneshot};
-use tracing::{error, info, warn};
+use tokio::sync::{mpsc, oneshot, Notify};
+use tracing::{debug, error, info, warn};
 
 use crate::config::MqttConfig;
 use crate::error::{Error, Result};
@@ -23,6 +23,8 @@ const MQTT_REQUEST_CAPACITY: usize = 64;
 // Upper bound on waiting for room in the request channel while connected,
 // covering a disconnect that races with the `is_connected()` check.
 const MQTT_PUBLISH_TIMEOUT: Duration = Duration::from_secs(5);
+// How long shutdown waits for the final publishes + DISCONNECT to go out.
+const MQTT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
 // ── Inbound MQTT commands ─────────────────────────────────────────────────────
 
@@ -38,6 +40,8 @@ pub enum MqttCommand {
     },
     GetDevice {
         friendly_name: String,
+        /// z2m's `{"state": ""}`-style list of keys to read; `Null` = all.
+        payload: serde_json::Value,
     },
 }
 
@@ -50,6 +54,14 @@ struct LinkState {
     connected: AtomicBool,
     /// Publishes dropped since the link last went down.
     dropped: AtomicU64,
+    /// A publish was dropped while the link looked up (it never reconnected,
+    /// so nothing else would resend that state).
+    lost_while_connected: AtomicBool,
+    /// Set once the bridge is shutting down: the event loop stops
+    /// reconnecting.
+    shutting_down: AtomicBool,
+    /// Signalled when our DISCONNECT has been written to the broker.
+    disconnect_sent: Notify,
 }
 
 impl LinkState {
@@ -64,6 +76,8 @@ impl LinkState {
     /// Mark the link up; returns how many publishes were dropped while it was down.
     fn set_connected(&self) -> u64 {
         self.connected.store(true, Ordering::Relaxed);
+        // Everything is republished on (re)connect anyway.
+        self.lost_while_connected.store(false, Ordering::Relaxed);
         self.dropped.swap(0, Ordering::Relaxed)
     }
 
@@ -198,6 +212,18 @@ impl MqttBridge {
         self.publish(&topic, bytes, false).await
     }
 
+    /// Remove a Home Assistant entity: an empty retained payload on its
+    /// discovery topic.
+    pub async fn clear_ha_discovery(
+        &self,
+        component: &str,
+        node_id: &str,
+        object_id: &str,
+    ) -> Result<()> {
+        let topic = format!("homeassistant/{component}/{node_id}/{object_id}/config");
+        self.publish(&topic, Vec::new(), true).await
+    }
+
     /// Publish a Home Assistant MQTT discovery config.
     pub async fn publish_ha_discovery(
         &self,
@@ -231,6 +257,7 @@ impl MqttBridge {
                 Ok(result) => result.map_err(Error::Mqtt),
                 Err(_) => {
                     self.note_dropped(topic);
+                    self.link.lost_while_connected.store(true, Ordering::Relaxed);
                     Ok(())
                 }
             };
@@ -251,6 +278,32 @@ impl MqttBridge {
     fn note_dropped(&self, topic: &str) {
         if self.link.note_dropped() {
             warn!("MQTT send queue full (broker unreachable?), dropping publishes until reconnect, first: {topic}");
+        }
+    }
+
+    /// Whether publishes were lost without a reconnect since the last call
+    /// (the caller should republish state).
+    pub fn take_lost_publishes(&self) -> bool {
+        self.link.is_connected() && self.link.lost_while_connected.swap(false, Ordering::Relaxed)
+    }
+
+    /// Graceful shutdown: send a clean DISCONNECT after everything already
+    /// queued (in particular the offline `bridge/state`), and wait briefly
+    /// for it to be written. A clean DISCONNECT makes the broker discard our
+    /// last will, so this must only follow the explicit offline publish.
+    pub async fn disconnect(&self) {
+        self.link.shutting_down.store(true, Ordering::Relaxed);
+        if !self.link.is_connected() {
+            return;
+        }
+        let sent = self.link.disconnect_sent.notified();
+        let flush = async {
+            if self.client.disconnect().await.is_ok() {
+                sent.await;
+            }
+        };
+        if tokio::time::timeout(MQTT_SHUTDOWN_TIMEOUT, flush).await.is_err() {
+            warn!("Timed out flushing MQTT messages on shutdown");
         }
     }
 }
@@ -291,14 +344,33 @@ async fn run_event_loop(
                 ));
             }
             Ok(Event::Incoming(Packet::Publish(pub_msg))) => {
-                if let Some(cmd) =
+                let Some(cmd) =
                     command_from_publish(&pub_msg.topic, &pub_msg.payload, &base_topic)
-                {
-                    let _ = cmd_tx.send(cmd);
+                else {
+                    continue;
+                };
+                // The broker sets `retain` only when replaying a stored
+                // message to a new subscription -- live publishes always
+                // arrive with it clear. A command someone published with
+                // retain=true would otherwise be re-executed on every
+                // reconnect (lights toggling, network opening for joins).
+                if pub_msg.retain {
+                    warn!(
+                        "Ignoring retained command on {} (publish commands without the retain flag; clear it with an empty retained message)",
+                        pub_msg.topic
+                    );
+                    continue;
                 }
+                let _ = cmd_tx.send(cmd);
+            }
+            Ok(Event::Outgoing(Outgoing::Disconnect)) => {
+                link.disconnect_sent.notify_one();
             }
             Ok(Event::Incoming(Packet::Disconnect)) => {
                 link.set_disconnected();
+                if link.shutting_down.load(Ordering::Relaxed) {
+                    break;
+                }
                 warn!(
                     "MQTT disconnected, retrying in {}s",
                     reconnect_delay.as_secs()
@@ -309,6 +381,10 @@ async fn run_event_loop(
             Ok(_) => {}
             Err(e) => {
                 link.set_disconnected();
+                if link.shutting_down.load(Ordering::Relaxed) {
+                    debug!("MQTT event loop stopped: {e}");
+                    break;
+                }
                 error!(
                     "MQTT event loop error: {e}; retrying in {}s",
                     reconnect_delay.as_secs()
@@ -374,10 +450,21 @@ fn command_from_publish(topic: &str, payload: &[u8], base_topic: &str) -> Option
         return None;
     }
 
-    if segments[verb_idx] == "get" {
-        return Some(MqttCommand::GetDevice { friendly_name });
-    }
     let parsed = serde_json::from_slice::<serde_json::Value>(payload);
+    if segments[verb_idx] == "get" {
+        let payload = match attribute {
+            // `{name}/get/state` == `{name}/get` with `{"state": ""}`
+            Some(attr) => json!({ attr: "" }),
+            None => match parsed {
+                Ok(v @ serde_json::Value::Object(_)) => v,
+                _ => serde_json::Value::Null,
+            },
+        };
+        return Some(MqttCommand::GetDevice {
+            friendly_name,
+            payload,
+        });
+    }
     let payload = match attribute {
         // `{name}/set/brightness` with payload `200` == `{name}/set` with `{"brightness":200}`
         Some(attr) => {
@@ -429,6 +516,12 @@ async fn subscribe_topics(client: &AsyncClient, base_topic: &str) -> bool {
 fn parse_permit_join_payload(payload: &[u8]) -> u8 {
     // Try JSON: {"value": true, "time": 254} or {"value": true}
     if let Ok(v) = serde_json::from_slice::<serde_json::Value>(payload) {
+        match v.as_bool().or_else(|| v.get("value").and_then(serde_json::Value::as_bool)) {
+            // An explicit disable wins over any `time`.
+            Some(false) => return 0,
+            Some(true) if v.get("time").is_none() => return 254,
+            _ => {}
+        }
         if let Some(time) = v.get("time").and_then(|t| t.as_u64()) {
             return time.min(254) as u8;
         }
@@ -472,6 +565,14 @@ mod tests {
     #[test]
     fn parse_permit_join_json_false() {
         assert_eq!(parse_permit_join_payload(br#"{"value": false}"#), 0);
+    }
+
+    #[test]
+    fn parse_permit_join_false_wins_over_time_and_bare_bools() {
+        assert_eq!(parse_permit_join_payload(br#"{"value": false, "time": 120}"#), 0);
+        assert_eq!(parse_permit_join_payload(b"true"), 254);
+        assert_eq!(parse_permit_join_payload(b"false"), 0);
+        assert_eq!(parse_permit_join_payload(br#"{"time": 0}"#), 0);
     }
 
     #[test]
@@ -574,7 +675,16 @@ mod tests {
     fn command_from_get() {
         assert!(matches!(
             command_from_publish("zigbee2mqtt/lamp/get", b"", "zigbee2mqtt"),
-            Some(MqttCommand::GetDevice { friendly_name }) if friendly_name == "lamp"
+            Some(MqttCommand::GetDevice { friendly_name, payload })
+                if friendly_name == "lamp" && payload.is_null()
+        ));
+        assert!(matches!(
+            command_from_publish("zigbee2mqtt/lamp/get", br#"{"state":""}"#, "zigbee2mqtt"),
+            Some(MqttCommand::GetDevice { payload, .. }) if payload == json!({"state": ""})
+        ));
+        assert!(matches!(
+            command_from_publish("zigbee2mqtt/lamp/get/brightness", b"", "zigbee2mqtt"),
+            Some(MqttCommand::GetDevice { payload, .. }) if payload == json!({"brightness": ""})
         ));
     }
 
@@ -615,7 +725,7 @@ mod tests {
         );
         assert!(matches!(
             command_from_publish("zigbee2mqtt/room/light/get", b"", "zigbee2mqtt"),
-            Some(MqttCommand::GetDevice { friendly_name }) if friendly_name == "room/light"
+            Some(MqttCommand::GetDevice { friendly_name, .. }) if friendly_name == "room/light"
         ));
     }
 

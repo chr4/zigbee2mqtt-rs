@@ -36,9 +36,10 @@ impl ClusterHandler for PowerCluster {
                         }
                         // value is half-percent; clamp to 0-100
                         let pct = (v / 2.0).clamp(0.0, 100.0);
+                        // No derived `battery_low` here: IAS devices report
+                        // that bit themselves, and two sources disagreeing
+                        // made it flap.
                         out.push(("battery".into(), json!(pct.round() as u8)));
-                        // low battery boolean (< 10 %)
-                        out.push(("battery_low".into(), json!(pct < 10.0)));
                     }
                 }
                 _ => {}
@@ -60,10 +61,7 @@ mod tests {
             value: AttributeValue::U8(160), // 80%
         }];
         let out = PowerCluster.process_reports(&reports);
-        assert_eq!(out, vec![
-            ("battery".into(), json!(80)),
-            ("battery_low".into(), json!(false)),
-        ]);
+        assert_eq!(out, vec![("battery".into(), json!(80))]);
     }
 
     #[test]

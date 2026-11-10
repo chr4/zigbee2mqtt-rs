@@ -1,12 +1,14 @@
 pub mod znp;
 
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 
 use crate::config::{AdapterType, Config};
 use crate::error::Result;
 use crate::zigbee::IeeeAddr;
-use znp::{ZnpCoordinator, ZnpHandle};
+use znp::ZnpCoordinator;
+
+pub use znp::{Delivery, ZnpHandle};
 
 #[derive(Debug, Clone)]
 pub enum CoordinatorEvent {
@@ -17,7 +19,8 @@ pub enum CoordinatorEvent {
     DeviceLeft {
         ieee_addr: IeeeAddr,
     },
-    /// IEEE↔NWK address resolved (from ZDO_IEEE_ADDR_RSP or TC_DEV_IND).
+    /// IEEE↔NWK address resolved (from ZDO_IEEE_ADDR_RSP, ZDO_NWK_ADDR_RSP or
+    /// TC_DEV_IND).
     AddressResolved {
         ieee_addr: IeeeAddr,
         nwk_addr: u16,
@@ -25,6 +28,11 @@ pub enum CoordinatorEvent {
     Message {
         src_addr: u16,
         src_ep: u8,
+        /// Our endpoint the frame was addressed to.
+        dst_ep: u8,
+        /// Sent as a broadcast/groupcast rather than to us directly (such
+        /// frames never get a ZCL Default Response).
+        was_broadcast: bool,
         cluster_id: u16,
         link_quality: u8,
         data: Vec<u8>,
@@ -41,7 +49,14 @@ pub enum CoordinatorEvent {
         input_clusters: Vec<u16>,
         output_clusters: Vec<u16>,
     },
-    /// Result of a ZDO_BIND_REQ (see `CoordinatorHandle::request_bind`).
+    /// A device joined or re-joined through the trust center (TC_DEV_IND):
+    /// a (re)paired device, which may have lost its bindings, reporting
+    /// configuration and IAS enrollment.
+    TrustCenterJoin {
+        ieee_addr: IeeeAddr,
+        nwk_addr: u16,
+    },
+    /// Result of a ZDO_BIND_REQ (see `ZnpHandle::request_bind`).
     BindRsp {
         nwk_addr: u16,
         status: u8,
@@ -56,72 +71,17 @@ pub struct CoordinatorInfo {
 }
 
 pub struct CoordinatorHandle {
-    pub inner: Arc<Mutex<ZnpHandle>>,
+    /// Send side. Shared by the bridge's spawned tasks; never needs locking.
+    pub znp: Arc<ZnpHandle>,
     pub events: mpsc::Receiver<CoordinatorEvent>,
     pub info: CoordinatorInfo,
-}
-
-impl CoordinatorHandle {
-    pub async fn permit_join(&self, duration: u8) -> Result<()> {
-        self.inner.lock().await.permit_join(duration).await
-    }
-
-    pub async fn send_zcl(
-        &self,
-        dst_addr: u16,
-        dst_ep: u8,
-        cluster_id: u16,
-        trans_id: u8,
-        payload: Vec<u8>,
-    ) -> Result<()> {
-        self.inner
-            .lock()
-            .await
-            .send_zcl(dst_addr, dst_ep, cluster_id, trans_id, payload)
-            .await
-    }
-
-    pub async fn request_active_eps(&self, nwk_addr: u16) -> Result<()> {
-        self.inner.lock().await.request_active_eps(nwk_addr).await
-    }
-
-    pub async fn request_simple_desc(&self, nwk_addr: u16, endpoint: u8) -> Result<()> {
-        self.inner
-            .lock()
-            .await
-            .request_simple_desc(nwk_addr, endpoint)
-            .await
-    }
-
-    pub async fn request_ieee_addr(&self, nwk_addr: u16) -> Result<()> {
-        self.inner.lock().await.request_ieee_addr(nwk_addr).await
-    }
-
-    /// Bind `cluster_id` on the device at `dst_addr`'s `src_ep` to `dst_ieee`'s
-    /// `dst_ep` (normally this coordinator's own address). See
-    /// `znp::commands::zdo_bind_req` for why this is needed.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn request_bind(
-        &self,
-        dst_addr: u16,
-        src_ieee: [u8; 8],
-        src_ep: u8,
-        cluster_id: u16,
-        dst_ieee: [u8; 8],
-        dst_ep: u8,
-    ) -> Result<()> {
-        self.inner
-            .lock()
-            .await
-            .request_bind(dst_addr, src_ieee, src_ep, cluster_id, dst_ieee, dst_ep)
-            .await
-    }
 }
 
 pub async fn open_coordinator(cfg: &Config) -> Result<CoordinatorHandle> {
     match cfg.serial.adapter {
         AdapterType::Znp | AdapterType::Auto => {
-            let coord = ZnpCoordinator::open(&cfg.serial.port, cfg.serial.baudrate)?;
+            let coord =
+                ZnpCoordinator::open(&cfg.serial.port, cfg.serial.baudrate, cfg.serial.rtscts)?;
             coord.start(cfg).await
         }
         AdapterType::Ezsp => Err(crate::error::Error::Config(

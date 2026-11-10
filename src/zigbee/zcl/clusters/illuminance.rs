@@ -17,8 +17,15 @@ impl ClusterHandler for IlluminanceCluster {
         for r in reports {
             if r.attr_id == MEASURED_VALUE {
                 if let Some(v) = r.value.as_f64() {
-                    if v > 0.0 && v < 0xFFFF as f64 {
-                        let lux = f64::powf(10.0, (v - 1.0) / 10_000.0);
+                    // 0 = too dark to measure (report 0 lux, not nothing:
+                    // otherwise lux stays at the last daylight value all
+                    // night); 0xFFFF = invalid.
+                    if v < 0xFFFF as f64 {
+                        let lux = if v <= 0.0 {
+                            0.0
+                        } else {
+                            f64::powf(10.0, (v - 1.0) / 10_000.0)
+                        };
                         out.push(("illuminance".into(), json!(lux.round() as u32)));
                         out.push(("illuminance_lux".into(), json!(lux.round() as u32)));
                     }

@@ -177,6 +177,30 @@ pub async fn publish_discovery(
     }
 }
 
+/// After a device's IAS ZoneType became known (or changed), remove the
+/// binary_sensor published for the previous classification if it was a
+/// different field -- e.g. the `contact` entity a motion sensor got before
+/// its ZoneType was read -- so Home Assistant doesn't keep a dead entity.
+pub async fn clear_stale_ias_entity(
+    mqtt: &MqttBridge,
+    device: &Device,
+    previous_zone_type: Option<u16>,
+) {
+    use crate::zigbee::zcl::clusters::ias_zone;
+    let (old_field, ..) = ias_zone::ha_binary_sensor_fields(previous_zone_type);
+    let (new_field, ..) = ias_zone::ha_binary_sensor_fields(device.zone_type);
+    if old_field == new_field {
+        return;
+    }
+    let ieee_hex = device.ieee_addr.as_hex();
+    if let Err(e) = mqtt
+        .clear_ha_discovery("binary_sensor", &ieee_hex, old_field)
+        .await
+    {
+        warn!("Failed to remove stale HA entity {old_field} of {ieee_hex}: {e}");
+    }
+}
+
 /// Shared context for the numeric-sensor discovery configs below (temperature,
 /// humidity, illuminance, battery), which otherwise differ only in the
 /// device_class/unit_of_measurement pair.
@@ -214,14 +238,19 @@ fn device_block(device: &Device, _base_topic: &str, coordinator_ieee: &str) -> V
     // migrations by `identifiers`, so using our own base_topic here would
     // make HA treat every device as new whenever base_topic isn't literally
     // "zigbee2mqtt", breaking migration from a real zigbee2mqtt install.
-    json!({
+    let mut block = json!({
         "identifiers": [format!("zigbee2mqtt_{ieee_hex}")],
         "name": device.friendly_name,
         "manufacturer": device.manufacturer.as_deref().unwrap_or("Unknown"),
         "model": device.model.as_deref().unwrap_or("Unknown"),
-        "sw_version": device.sw_build_id,
         "via_device": format!("zigbee2mqtt_{coordinator_ieee}"),
-    })
+    });
+    // Omitted rather than null: Home Assistant validates it as a string and
+    // a null can get the whole discovery config rejected.
+    if let Some(sw) = &device.sw_build_id {
+        block["sw_version"] = json!(sw);
+    }
+    block
 }
 
 fn availability_block(base_topic: &str) -> Value {
@@ -382,6 +411,14 @@ mod tests {
         // infix)
         let via = block["via_device"].as_str().unwrap();
         assert!(via.starts_with("zigbee2mqtt_0x"));
+    }
+
+    #[test]
+    fn device_block_omits_unknown_sw_version() {
+        let mut dev = make_light();
+        assert!(device_block(&dev, BASE, COORD_IEEE).get("sw_version").is_none());
+        dev.sw_build_id = Some("2.3.093".into());
+        assert_eq!(device_block(&dev, BASE, COORD_IEEE)["sw_version"], "2.3.093");
     }
 
     #[test]

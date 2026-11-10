@@ -35,6 +35,8 @@ struct DbEntry {
     endpoints: HashMap<String, DbEndpoint>,
     #[serde(default)]
     interview_completed: bool,
+    #[serde(default)]
+    meta: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -50,6 +52,30 @@ struct DbEndpoint {
     in_cluster_list: Vec<u16>,
     #[serde(default)]
     out_cluster_list: Vec<u16>,
+    /// zigbee-herdsman's per-cluster attribute cache, e.g.
+    /// `{"ssIasZone": {"attributes": {"zoneType": 13}}}`.
+    #[serde(default)]
+    clusters: serde_json::Map<String, serde_json::Value>,
+}
+
+/// `meta` key this bridge sets once it has configured a device's bindings and
+/// reporting. zigbee2mqtt's own marker is `meta.configured` (a hash of its
+/// configure function), which counts too.
+pub const META_CONFIGURED: &str = "zigbee2mqttRsConfigured";
+
+/// herdsman cluster/attribute names under which the IAS ZoneType is cached.
+pub const IAS_ZONE_CLUSTER: &str = "ssIasZone";
+pub const ZONE_TYPE_ATTR: &str = "zoneType";
+
+impl DbEndpoint {
+    fn zone_type(&self) -> Option<u16> {
+        self.clusters
+            .get(IAS_ZONE_CLUSTER)?
+            .get("attributes")?
+            .get(ZONE_TYPE_ATTR)?
+            .as_u64()
+            .and_then(|v| u16::try_from(v).ok())
+    }
 }
 
 /// Load devices from a zigbee2mqtt database.db file.
@@ -120,10 +146,18 @@ pub fn load_database(
         dev.model = entry.model_id;
         dev.sw_build_id = entry.sw_build_id;
         dev.interview_complete = entry.interview_completed;
+        dev.configured = entry.meta.contains_key("configured")
+            || entry.meta.get(META_CONFIGURED).and_then(serde_json::Value::as_bool) == Some(true);
 
-        // Import endpoints
-        for (ep_key, ep_data) in &entry.endpoints {
+        // Import endpoints, in endpoint order (HashMap order is random, and
+        // the first endpoint with a cluster is the one commands go to).
+        let mut endpoints: Vec<_> = entry.endpoints.iter().collect();
+        endpoints.sort_by_key(|(key, ep)| key.parse::<u8>().unwrap_or(ep.ep_id));
+        for (ep_key, ep_data) in endpoints {
             let ep_id = ep_key.parse::<u8>().unwrap_or(ep_data.ep_id);
+            if dev.zone_type.is_none() {
+                dev.zone_type = ep_data.zone_type();
+            }
             dev.endpoints.push(EndpointDesc {
                 endpoint: ep_id,
                 profile_id: ep_data.prof_id,
@@ -314,6 +348,37 @@ mod tests {
     fn parse_ieee_invalid() {
         assert!(parse_ieee("0x1234").is_none());
         assert!(parse_ieee("not_hex").is_none());
+    }
+
+    #[test]
+    fn zone_type_and_configured_imported() {
+        let db = r#"{"id":4,"type":"EndDevice","ieeeAddr":"0x00158d0001020304","nwkAddr":100,"endpoints":{"1":{"epId":1,"inClusterList":[0,1280],"outClusterList":[],"clusters":{"ssIasZone":{"attributes":{"zoneType":13,"iasCieAddr":"0x00124b00120144ae"}}}}},"interviewCompleted":true,"meta":{"configured":1}}
+{"id":5,"type":"Router","ieeeAddr":"0x00158d0001020305","nwkAddr":101,"endpoints":{},"interviewCompleted":true,"meta":{}}"#;
+        let dir = std::env::temp_dir().join(format!("z2m_zone_db_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("database.db");
+        std::fs::write(&path, db).unwrap();
+        let (devices, _) = load_database(&path, &HashMap::new());
+        std::fs::remove_dir_all(&dir).ok();
+        let ias = devices.iter().find(|d| d.nwk_addr == 100).unwrap();
+        assert_eq!(ias.zone_type, Some(13));
+        assert!(ias.configured);
+        let other = devices.iter().find(|d| d.nwk_addr == 101).unwrap();
+        assert_eq!(other.zone_type, None);
+        assert!(!other.configured);
+    }
+
+    #[test]
+    fn endpoints_imported_in_order() {
+        let db = r#"{"id":4,"type":"Router","ieeeAddr":"0x00158d0001020304","nwkAddr":100,"endpoints":{"242":{"epId":242},"2":{"epId":2},"11":{"epId":11},"1":{"epId":1}},"interviewCompleted":true}"#;
+        let dir = std::env::temp_dir().join(format!("z2m_ep_order_db_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("database.db");
+        std::fs::write(&path, db).unwrap();
+        let (devices, _) = load_database(&path, &HashMap::new());
+        std::fs::remove_dir_all(&dir).ok();
+        let eps: Vec<u8> = devices[0].endpoints.iter().map(|e| e.endpoint).collect();
+        assert_eq!(eps, vec![1, 2, 11, 242]);
     }
 
     #[test]

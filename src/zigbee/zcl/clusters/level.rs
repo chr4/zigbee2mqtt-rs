@@ -27,21 +27,20 @@ impl ClusterHandler for LevelCluster {
     }
 
     fn process_command(&self, command_id: u8, payload: &[u8]) -> Vec<(String, Value)> {
+        // Commands *received* by the coordinator come from a controller (a
+        // remote or dimmer switch bound to us), never from a light reporting
+        // its own level -- so like the other commands below they're a
+        // button-press `action`, not the sender's `brightness` state
+        // (zigbee-herdsman-converters' `command_move_to_level`).
         match command_id {
             // Move to Level (0x00) and Move to Level / On (0x04)
-            0x00 | 0x04 => {
-                if payload.is_empty() {
-                    return vec![];
-                }
-                let level = payload[0];
-                vec![
-                    ("brightness".into(), json!(level)),
-                    (
-                        "brightness_percent".into(),
-                        json!((level as f64 / 254.0 * 100.0) as u8),
-                    ),
-                ]
-            }
+            0x00 | 0x04 => match payload.first() {
+                Some(&level) => vec![
+                    ("action".into(), json!("brightness_move_to_level")),
+                    ("action_level".into(), json!(level)),
+                ],
+                None => vec![],
+            },
             // Move/Step/Stop, plain vs. With-On-Off variants: real remotes
             // (e.g. IKEA TRADFRI) encode which button (up/down) was pressed
             // by *which command variant* they send, not by the MoveMode/
@@ -162,6 +161,18 @@ mod tests {
             LevelCluster.process_command(0x03, &[]),
             vec![("action".into(), json!("brightness_down_release"))]
         );
+    }
+
+    #[test]
+    fn move_to_level_from_remote_is_an_action() {
+        assert_eq!(
+            LevelCluster.process_command(0x04, &[0x80, 0x0A, 0x00]),
+            vec![
+                ("action".into(), json!("brightness_move_to_level")),
+                ("action_level".into(), json!(0x80)),
+            ]
+        );
+        assert!(LevelCluster.process_command(0x00, &[]).is_empty());
     }
 
     #[test]
