@@ -45,8 +45,8 @@ const HOUSEKEEPING_INTERVAL: Duration = Duration::from_secs(10);
 const COORDINATOR_PING_INTERVAL: Duration = Duration::from_secs(60);
 
 /// At most one reconfiguration per device per this period triggered by
-/// trust-center (re)joins.
-const TC_REJOIN_SETUP_INTERVAL: Duration = Duration::from_secs(6 * 3600);
+/// trust-center (re)joins (a sleepy device may rejoin repeatedly).
+const TC_REJOIN_SETUP_INTERVAL: Duration = Duration::from_secs(600);
 
 /// Minimum gap between full republishes after MQTT publishes were dropped.
 const LOST_PUBLISH_REPUBLISH_INTERVAL: Duration = Duration::from_secs(300);
@@ -304,7 +304,9 @@ struct Runtime {
     state_refreshes: RateLimiter<IeeeAddr>,
     zone_type_reads: RateLimiter<IeeeAddr>,
     configure_attempts: HashMap<IeeeAddr, (u32, Instant)>,
-    setups_in_flight: HashSet<IeeeAddr>,
+    /// Running setups: generation and abort handle.
+    setups_in_flight: HashMap<IeeeAddr, (u64, tokio::task::AbortHandle)>,
+    setup_generation: u64,
     /// Interviewed devices whose post-interview setup hasn't succeeded yet.
     pending_full_setup: HashSet<IeeeAddr>,
     /// Permit-join requests go to one worker task in order, so a disable is
@@ -360,7 +362,8 @@ impl Runtime {
             state_refreshes: RateLimiter::new(REFRESH_MIN_INTERVAL),
             zone_type_reads: RateLimiter::new(ZONE_TYPE_READ_INTERVAL),
             configure_attempts: HashMap::new(),
-            setups_in_flight: HashSet::new(),
+            setups_in_flight: HashMap::new(),
+            setup_generation: 0,
             pending_full_setup: HashSet::new(),
             permit_join_tx,
             last_lost_republish: None,
@@ -398,6 +401,9 @@ impl Runtime {
                 if interviewed && self.tc_rejoin_setups.allow(ieee_addr, Instant::now()) {
                     info!("{ieee_addr} joined through the trust center, reconfiguring");
                     self.pending_full_setup.insert(ieee_addr);
+                    // A fresh pairing deserves fresh attempts; the limiter
+                    // above bounds how often this happens.
+                    self.configure_attempts.remove(&ieee_addr);
                     self.maybe_configure(ieee_addr);
                 }
             }
@@ -507,7 +513,9 @@ impl Runtime {
         self.devices().remove_by_ieee(&ieee);
         self.store.forget_device(&ieee);
         self.lanes.close(&ieee);
-        self.setups_in_flight.remove(&ieee);
+        if let Some((_, task)) = self.setups_in_flight.remove(&ieee) {
+            task.abort();
+        }
         self.pending_full_setup.remove(&ieee);
         self.configure_attempts.remove(&ieee);
         if let Err(e) = self
@@ -838,23 +846,16 @@ impl Runtime {
                         .await;
                 }
             }
-            Internal::Toggled { ieee } => {
-                let published = {
-                    let Some(mut dev) = self.devices().get_mut_by_ieee(&ieee) else {
-                        return;
-                    };
-                    let flipped = match dev.state.get("state").and_then(Value::as_str) {
-                        Some(s) if s.eq_ignore_ascii_case("ON") => "OFF",
-                        Some(s) if s.eq_ignore_ascii_case("OFF") => "ON",
-                        // Unknown: don't guess; a report (if configured) follows.
-                        _ => return,
-                    };
-                    dev.state.insert("state".into(), json!(flipped));
-                    (dev.friendly_name.clone(), Value::Object(dev.state.clone()))
-                };
-                self.publish_state(&published.0, &published.1).await;
-            }
-            Internal::SetupDone { ieee, full, ok } => {
+            Internal::SetupDone {
+                ieee,
+                full,
+                ok,
+                generation,
+            } => {
+                // A setup from before the device left and re-paired.
+                if self.setups_in_flight.get(&ieee).map(|s| s.0) != Some(generation) {
+                    return;
+                }
                 self.setups_in_flight.remove(&ieee);
                 if ok && full {
                     self.pending_full_setup.remove(&ieee);
@@ -875,18 +876,23 @@ impl Runtime {
                     self.permit_join.refresh_in_flight = false;
                 }
                 if !ok {
+                    if duration == 0 {
+                        // Keep trying to close the network (housekeeping).
+                        self.permit_join.disable_pending = true;
+                    }
                     return;
+                }
+                if duration == 0 {
+                    self.permit_join.disable_pending = false;
                 }
                 let now = Instant::now();
-                if refresh && !self.permit_join.keep_enabled {
-                    // Disabled over MQTT while this refresh was in flight;
-                    // that disable was queued after it, so the network is
-                    // closed again.
-                    return;
-                }
+                // Track what the coordinator holds, whatever was requested.
                 let was_enabled = self.permit_join.enabled(now);
                 self.permit_join.on_sent(duration, now);
-                if !refresh || !was_enabled {
+                // A refresh overtaken by an MQTT disable: the queued disable
+                // reports the final state.
+                let stale_refresh = refresh && !self.permit_join.keep_enabled;
+                if !stale_refresh && (!refresh || !was_enabled) {
                     self.publish_bridge_info().await;
                 }
             }
@@ -903,6 +909,11 @@ impl Runtime {
 
         if self.permit_join.needs_refresh(now) && !self.permit_join.refresh_in_flight {
             self.spawn_permit_join(PERMIT_JOIN_MAX, true);
+        }
+        if self.permit_join.disable_pending {
+            self.permit_join.disable_pending = false;
+            warn!("Retrying to disable permit join");
+            self.spawn_permit_join(0, false);
         }
         if self.permit_join.take_expired(now) {
             info!("Permit join expired");
@@ -998,7 +1009,7 @@ impl Runtime {
         let needs_config = !dev.configured && auto_configurable(&dev);
         if !dev.interview_complete
             || !(full || needs_config)
-            || self.setups_in_flight.contains(&ieee)
+            || self.setups_in_flight.contains_key(&ieee)
         {
             return;
         }
@@ -1010,8 +1021,16 @@ impl Runtime {
             return;
         }
         *entry = (entry.0 + 1, now);
-        self.setups_in_flight.insert(ieee);
-        jobs::spawn_setup(&self.ctx, ieee, full);
+        self.start_setup(ieee, full);
+    }
+
+    fn start_setup(&mut self, ieee: IeeeAddr, full: bool) {
+        self.setup_generation += 1;
+        let generation = self.setup_generation;
+        let task = jobs::spawn_setup(&self.ctx, ieee, full, generation);
+        if let Some((_, old)) = self.setups_in_flight.insert(ieee, (generation, task)) {
+            old.abort();
+        }
     }
 
     /// Mark the device at `nwk_addr` interviewed (if it isn't already and has
@@ -1046,8 +1065,7 @@ impl Runtime {
         // IAS enrollment and the interview reads, not just reporting.
         self.pending_full_setup.insert(dev.ieee_addr);
         self.configure_attempts.remove(&dev.ieee_addr);
-        self.setups_in_flight.insert(dev.ieee_addr);
-        jobs::spawn_setup(&self.ctx, dev.ieee_addr, true);
+        self.start_setup(dev.ieee_addr, true);
     }
 
     /// Basic cluster (0x0000) attributes update device metadata; republish
@@ -1451,6 +1469,8 @@ struct PermitJoin {
     keep_enabled: bool,
     /// A keep-open refresh request is on its way to the coordinator.
     refresh_in_flight: bool,
+    /// A disable failed and must be re-sent.
+    disable_pending: bool,
 }
 
 impl PermitJoin {

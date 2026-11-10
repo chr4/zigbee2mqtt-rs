@@ -117,15 +117,14 @@ pub(super) enum Internal {
     /// Publish the cached state as is (`get` with nothing to read).
     PublishCached { ieee: IeeeAddr },
     /// A device setup finished (`full`: it was the post-interview one).
+    /// `generation` identifies the setup, so a stale result (from before the
+    /// device left and re-paired) can be told apart.
     SetupDone {
         ieee: IeeeAddr,
         full: bool,
         ok: bool,
+        generation: u64,
     },
-    /// A TOGGLE was delivered: invert the known on/off state. Done by the
-    /// main loop, which has the up-to-date state even if earlier optimistic
-    /// updates from this lane are still queued.
-    Toggled { ieee: IeeeAddr },
     /// A permit-join request finished.
     PermitJoin {
         duration: u8,
@@ -285,9 +284,11 @@ async fn run_set(ctx: &Ctx, dev: &Device, payload: &Value) {
         {
             Ok(delivery) => {
                 if !idempotent {
-                    let _ = ctx.internal_tx.send(Internal::Toggled {
-                        ieee: dev.ieee_addr,
-                    });
+                    // TOGGLE: the resulting state depends on what the device
+                    // was in, which any cached or optimistic value may not
+                    // reflect -- ask it (the answer is published like any
+                    // report).
+                    read_attributes(ctx, dev, cmd.endpoint, cmd.cluster, &[0x0000]).await;
                 }
                 if delivery == Delivery::Unconfirmed {
                     debug!(
@@ -349,18 +350,34 @@ async fn read_attributes(ctx: &Ctx, dev: &Device, ep: u8, cluster: u16, attrs: &
 /// Set a device up in the background: one device at a time network-wide,
 /// and outside its lane, so its (and every other device's) set/get commands
 /// never queue behind a long setup. Reports `Internal::SetupDone`.
-pub(super) fn spawn_setup(ctx: &Arc<Ctx>, ieee: IeeeAddr, full: bool) {
+/// Returns a handle to abort it (e.g. when the device leaves).
+pub(super) fn spawn_setup(
+    ctx: &Arc<Ctx>,
+    ieee: IeeeAddr,
+    full: bool,
+    generation: u64,
+) -> tokio::task::AbortHandle {
     let ctx = Arc::clone(ctx);
     tokio::spawn(async move {
         let ok = {
             let _slot = ctx.setup_slot.acquire().await;
             match ctx.devices.snapshot(&ieee) {
-                Some(dev) => run_setup(&ctx, &dev, full).await,
-                None => false,
+                // Only an interviewed device can be set up (it may have
+                // left and rejoined while this waited for the slot).
+                Some(dev) if dev.interview_complete && !dev.endpoints.is_empty() => {
+                    run_setup(&ctx, &dev, full).await
+                }
+                _ => false,
             }
         };
-        let _ = ctx.internal_tx.send(Internal::SetupDone { ieee, full, ok });
-    });
+        let _ = ctx.internal_tx.send(Internal::SetupDone {
+            ieee,
+            full,
+            ok,
+            generation,
+        });
+    })
+    .abort_handle()
 }
 
 /// Whether to configure bindings/reporting on `dev`. Xiaomi/Aqara (LUMI)
@@ -444,6 +461,12 @@ async fn run_setup(ctx: &Ctx, dev: &Device, full: bool) -> bool {
         tokio::time::sleep(Duration::from_secs(1)).await;
         if let Some(fresh) = ctx.devices.snapshot(&dev.ieee_addr) {
             dev = fresh;
+        }
+        if dev.manufacturer.is_none() && dev.model.is_none() {
+            // Basic answer not in yet: can't tell whether this is a device
+            // we mustn't configure. Count as incomplete; a retry decides.
+            debug!("Basic attributes of {} not known yet", dev.friendly_name);
+            return false;
         }
     }
     if !auto_configurable(&dev) {

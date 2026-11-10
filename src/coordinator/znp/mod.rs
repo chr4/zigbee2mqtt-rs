@@ -499,9 +499,11 @@ pub struct ZnpHandle {
     /// AF transaction IDs (matching AF_DATA_CONFIRMs to requests), separate
     /// from the ZCL sequence numbers inside the payloads.
     af_trans_id: AtomicU8,
-    /// IDs whose AF_DATA_CONFIRM is still awaited: never handed out again
-    /// meanwhile, or a confirm could reach the wrong waiter.
-    ids_in_use: Arc<std::sync::Mutex<[bool; 256]>>,
+    /// Per AF transaction ID: `None` while reserved, else when it was last
+    /// released. Reserved IDs are never handed out, and recently released
+    /// ones are avoided -- Z-Stack may still deliver a late AF_DATA_CONFIRM
+    /// for them, which must not reach a new waiter.
+    ids_in_use: Arc<std::sync::Mutex<[Option<std::time::Instant>; 256]>>,
     /// Bounds AF_DATA_REQUESTs waiting for their AF_DATA_CONFIRM -- every
     /// one we send, Default Responses included.
     data_slots: Arc<Semaphore>,
@@ -510,21 +512,25 @@ pub struct ZnpHandle {
 /// An AF transaction ID reserved until dropped.
 struct TransId {
     id: u8,
-    in_use: Arc<std::sync::Mutex<[bool; 256]>>,
+    in_use: Arc<std::sync::Mutex<[Option<std::time::Instant>; 256]>>,
 }
 
 impl Drop for TransId {
     fn drop(&mut self) {
-        self.in_use.lock().unwrap_or_else(|e| e.into_inner())[usize::from(self.id)] = false;
+        self.in_use.lock().unwrap_or_else(|e| e.into_inner())[usize::from(self.id)] =
+            Some(std::time::Instant::now());
     }
 }
+
+/// How long a released AF transaction ID is avoided (if any other is free).
+const TRANS_ID_QUARANTINE: Duration = Duration::from_secs(60);
 
 impl ZnpHandle {
     fn new(transport: ZnpTransport, max_data_requests: usize) -> Self {
         Self {
             transport,
             af_trans_id: AtomicU8::new(0),
-            ids_in_use: Arc::new(std::sync::Mutex::new([false; 256])),
+            ids_in_use: Arc::new(std::sync::Mutex::new([Some(std::time::Instant::now()); 256])),
             data_slots: Arc::new(Semaphore::new(max_data_requests)),
         }
     }
@@ -537,16 +543,32 @@ impl ZnpHandle {
     /// Reserve the next AF transaction ID not awaiting a confirm. At most
     /// `data_slots` IDs are reserved at a time, so one is always free.
     fn reserve_trans_id(&self) -> TransId {
-        let mut in_use = self.ids_in_use.lock().unwrap_or_else(|e| e.into_inner());
-        loop {
+        let mut ids = self.ids_in_use.lock().unwrap_or_else(|e| e.into_inner());
+        let now = std::time::Instant::now();
+        // Next free ID out of quarantine; failing that (e.g. a burst of
+        // >256 frames a minute), the free one released longest ago.
+        let mut oldest: Option<(u8, std::time::Instant)> = None;
+        let mut chosen = None;
+        for _ in 0..256 {
             let id = self.af_trans_id.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
-            if !in_use[usize::from(id)] {
-                in_use[usize::from(id)] = true;
-                return TransId {
-                    id,
-                    in_use: Arc::clone(&self.ids_in_use),
-                };
+            if let Some(released) = ids[usize::from(id)] {
+                if now.duration_since(released) >= TRANS_ID_QUARANTINE {
+                    chosen = Some(id);
+                    break;
+                }
+                if oldest.is_none_or(|(_, t)| released < t) {
+                    oldest = Some((id, released));
+                }
             }
+        }
+        // At most `data_slots` IDs are reserved, so one is always free.
+        let id = chosen
+            .or(oldest.map(|(id, _)| id))
+            .expect("more AF transaction IDs than in-flight requests");
+        ids[usize::from(id)] = None;
+        TransId {
+            id,
+            in_use: Arc::clone(&self.ids_in_use),
         }
     }
 
@@ -899,9 +921,14 @@ mod tests {
         let (transport, _events, _coord) = link();
         let znp = ZnpHandle::for_test(transport, 2);
         let held = znp.reserve_trans_id();
+        let mut seen = std::collections::HashSet::new();
         for _ in 0..600 {
-            assert_ne!(znp.reserve_trans_id().id, held.id);
+            let id = znp.reserve_trans_id().id;
+            assert_ne!(id, held.id);
+            seen.insert(id);
         }
+        // Released IDs are reused only once nothing fresher is left.
+        assert_eq!(seen.len(), 255);
     }
 
     #[test]
