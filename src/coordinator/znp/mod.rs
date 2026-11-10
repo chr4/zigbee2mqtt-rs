@@ -82,15 +82,10 @@ impl ZnpCoordinator {
         let device_info = self.get_device_info().await;
         match device_info.as_ref().and_then(|d| d.device_state) {
             Some(DEVICE_STATE_STARTED_AS_COORDINATOR) | None => {}
-            // Running on without a network would leave a bridge that looks
-            // healthy but never hears from a device; failing lets the
-            // supervisor retry the whole init.
-            Some(state) => {
-                return Err(Error::Znp(format!(
-                    "coordinator device state is 0x{state:02X}, not started as coordinator \
-                     (0x{DEVICE_STATE_STARTED_AS_COORDINATOR:02X})"
-                )))
-            }
+            Some(state) => error!(
+                "Coordinator device state is 0x{state:02X}, not started as coordinator \
+                 (0x{DEVICE_STATE_STARTED_AS_COORDINATOR:02X}) -- joins and messages may not work"
+            ),
         }
         info!("ZNP coordinator ready");
 
@@ -217,7 +212,8 @@ impl ZnpCoordinator {
         // has the key", and Z-Stack then sends a dummy (all-zero) key -- so
         // devices joining, or doing a trust-center rejoin after losing their
         // parent, end up without a usable key and drop off the network.
-        // zigbee-herdsman is recalled to write FALSE here as well.
+        // zigpy-znp writes False ("Z2M requires this item to be False") and
+        // zigbee-herdsman's default (networkKeyDistribute: false) is 0 too.
         self.nv_write(nv::PRECFGKEYS_ENABLE, &[0x00]).await?;
 
         // Enable ZDO direct callbacks (so we receive device announcements etc.)

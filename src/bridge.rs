@@ -44,6 +44,10 @@ const HOUSEKEEPING_INTERVAL: Duration = Duration::from_secs(10);
 /// bridge restarted) once some command timed out.
 const COORDINATOR_PING_INTERVAL: Duration = Duration::from_secs(60);
 
+/// At most one reconfiguration per device per this period triggered by
+/// trust-center (re)joins.
+const TC_REJOIN_SETUP_INTERVAL: Duration = Duration::from_secs(6 * 3600);
+
 /// Minimum gap between full republishes after MQTT publishes were dropped.
 const LOST_PUBLISH_REPUBLISH_INTERVAL: Duration = Duration::from_secs(300);
 
@@ -307,6 +311,7 @@ struct Runtime {
     /// never overtaken by an earlier enable or refresh.
     permit_join_tx: mpsc::UnboundedSender<(u8, bool)>,
     last_lost_republish: Option<Instant>,
+    tc_rejoin_setups: RateLimiter<IeeeAddr>,
 }
 
 impl Runtime {
@@ -359,6 +364,7 @@ impl Runtime {
             pending_full_setup: HashSet::new(),
             permit_join_tx,
             last_lost_republish: None,
+            tc_rejoin_setups: RateLimiter::new(TC_REJOIN_SETUP_INTERVAL),
         }
     }
 
@@ -379,20 +385,19 @@ impl Runtime {
             }
             CoordinatorEvent::TrustCenterJoin { ieee_addr, nwk_addr } => {
                 self.on_address_resolved(ieee_addr, nwk_addr).await;
-                // zigbee2mqtt reconfigures a device on every join: a device
-                // that was reset and re-paired lost its bindings, reporting
-                // and IAS enrollment. Redo the full post-interview setup.
-                let interviewed = match self.devices().get_mut_by_ieee(&ieee_addr) {
-                    Some(mut dev) if dev.interview_complete => {
-                        dev.configured = false;
-                        true
-                    }
-                    _ => false,
-                };
-                if interviewed {
+                // A device that was reset and re-paired lost its bindings,
+                // reporting and IAS enrollment: redo the full post-interview
+                // setup, like zigbee2mqtt reconfigures on join. Rate-limited
+                // (a sleepy device may rejoin often) and still subject to
+                // maybe_configure's attempt cap; `configured` is only
+                // changed by a setup that actually ran.
+                let interviewed = self
+                    .devices()
+                    .get_by_ieee(&ieee_addr)
+                    .is_some_and(|d| d.interview_complete);
+                if interviewed && self.tc_rejoin_setups.allow(ieee_addr, Instant::now()) {
                     info!("{ieee_addr} joined through the trust center, reconfiguring");
                     self.pending_full_setup.insert(ieee_addr);
-                    self.configure_attempts.remove(&ieee_addr);
                     self.maybe_configure(ieee_addr);
                 }
             }
@@ -916,6 +921,7 @@ impl Runtime {
         self.ieee_lookups.prune(now);
         self.state_refreshes.prune(now);
         self.zone_type_reads.prune(now);
+        self.tc_rejoin_setups.prune(now);
 
         if now.duration_since(self.last_ping) >= COORDINATOR_PING_INTERVAL {
             self.last_ping = now;

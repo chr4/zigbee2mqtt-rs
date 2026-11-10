@@ -172,8 +172,8 @@ pub fn af_data_request(
     data.push(trans_id);
     // Options: APS ack requested, so AF_DATA_CONFIRM reports end-to-end
     // delivery. NOT 0x20: that bit is SUPPRESS_ROUTE_DISC_NETWORK (zigpy-znp
-    // `TransmitOptions`), which stops the stack from finding a new route to
-    // a device whose old one broke -- it then stays unreachable.
+    // `TransmitOptions`: no route discovery for intermediate routes), so a
+    // broken route further along the path is never repaired.
     data.push(0x10);
     data.push(0xFF); // radius: max
     data.push(payload.len() as u8);
@@ -224,8 +224,8 @@ impl AfIncomingMsg {
 }
 
 /// Z-Stack `ZStatus` values that can come back in an AF_DATA_CONFIRM (or a
-/// failed AF_DATA_REQUEST SRSP), per Z-Stack's ZComDef.h / zigpy-znp's
-/// `Status` enum (recalled, not checked against the header here).
+/// failed AF_DATA_REQUEST SRSP), as in zigpy-znp's `Status` enum
+/// (zigpy_znp/types/named.py).
 pub mod status {
     pub const SUCCESS: u8 = 0x00;
     pub const MEM_ERROR: u8 = 0x10;

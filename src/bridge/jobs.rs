@@ -240,8 +240,12 @@ async fn run_lane(ctx: Arc<Ctx>, ieee: IeeeAddr, mut rx: mpsc::Receiver<Job>) {
             Job::Set(payload) => run_set(&ctx, &dev, &payload).await,
             Job::Get(payload) => run_get(&ctx, &dev, &payload).await,
             Job::Refresh => {
+                // Stop at the first failure: a bulb switched off at the wall
+                // would otherwise tie up in-flight slots retrying every read.
                 for (ep, cluster, attrs) in plan_reads(&dev, None) {
-                    read_attributes(&ctx, &dev, ep, cluster, &attrs).await;
+                    if !read_attributes(&ctx, &dev, ep, cluster, &attrs).await {
+                        break;
+                    }
                 }
             }
             Job::ReadZoneType => {
